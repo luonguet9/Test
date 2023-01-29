@@ -1,2 +1,23 @@
-# Test
-![image](https://user-images.githubusercontent.com/91581152/215302279-2501af27-9768-4d1b-afbb-bfec7b399a71.png)
+# Ghroem
+#### Music app Android
+#### Link Demo: 
+
+
+## Nghe nhạc cùng với các chức năng Play, Stop, Pause, Next, Prev, Repeat
+
+
+
+## Sắp xếp và tìm kiếm bài hát
+
+
+
+## Sử dụng service chạy nhầm và đưa các nút chức năng Play, Pause, Next, Prev lên thanh trạng thái
+
+
+
+## Thêm sửa xóa playlist. Thêm/xóa bài hát vào danh sách yêu thích và các playlist khác
+
+
+
+## Đa ngôn ngữ và giao diện
+
