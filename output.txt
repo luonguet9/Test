@@ -1,8 +1,99 @@
+commit 18d065e194f746eb03d285594e56c0012de6a698
+Author: DoNgocLuong <luongblue9@gmail.com>
+Date:   Tue Jun 2 20:47:02 2026 +0700
+
+    02/06
+
 diff --git a/app/app.py b/app/app.py
-index b51053b..472bd0b 100644
+index 3ac123d..472bd0b 100644
 --- a/app/app.py
 +++ b/app/app.py
-@@ -852,7 +852,12 @@ def api_cancel(job_id):
+@@ -169,10 +169,10 @@ AUDIO_FORMATS = {
+ }
+ 
+ DOWNLOAD_QUALITY = {
+-    "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+-    "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]",
+-    "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]",
+-    "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]",
++    "best":  "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
++    "1080p": "bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
++    "720p":  "bestvideo[height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
++    "480p":  "bestvideo[height<=480]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
+ }
+ 
+ DOWNLOAD_AUDIO_QUALITY = {
+@@ -244,7 +244,7 @@ class _AdaptiveGPUSemaphore:
+     1. Sß╗æ slot cß╗⌐ng (mß║╖c ─æß╗ïnh 4 concurrent job)
+     2. VRAM tß╗▒ do c├▓n lß║íi (> 10% tß╗òng VRAM)
+     3. RAM hß╗ç thß╗æng (> 2GB dß╗▒ trß╗»)
+-    
++
+     L╞░u ├╜: KH├öNG check % GPU Encoder Util v├¼ mß╗Öt video 4K NVENC
+     ─æ├ú chß║íy l├á lu├┤n c├│ Video Encode = 100%, kiß╗âm tra ─æ├│ sß║╜ block
+     m├úi m├úi v├á kh├┤ng bao giß╗¥ cho slot thß╗⌐ 2.
+@@ -393,6 +393,15 @@ def _fmt_size_bytes(b):
+ def _fmt_size_mb(path):
+     return os.path.getsize(path) / 1024**2
+ 
++def _parse_dl_size(text: str) -> int:
++    """Parse k├¡ch th╞░ß╗¢c file tß╗½ d├▓ng progress yt-dlp ΓåÆ bytes, hoß║╖c 0 nß║┐u kh├┤ng ─æß╗ìc ─æ╞░ß╗úc.
++    V├¡ dß╗Ñ: '[download]  2.7% of ~  1.44GiB at ...' ΓåÆ 1547600896
++    """
++    m = re.search(r'of\s+~?\s*([\d.]+)\s*(GiB|MiB|KiB|B)\b', text)
++    if not m: return 0
++    mult = {"GiB": 1 << 30, "MiB": 1 << 20, "KiB": 1 << 10, "B": 1}
++    return int(float(m.group(1)) * mult.get(m.group(2), 0))
++
+ # ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+ # FFPROBE
+ # ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+@@ -594,7 +603,7 @@ def _quality_args(enc: str, crf: int) -> list:
+     if enc in ("h264_nvenc","hevc_nvenc","av1_nvenc"):
+         # Fix: th├¬m -maxrate v├á -bufsize so vß╗¢i app.py c┼⌐
+         return ["-rc","vbr","-cq",str(crf),"-b:v","0",
+-                "-maxrate","20M","-bufsize","40M"]
++                "-maxrate","50M","-bufsize","100M"]
+     if enc in ("h264_amf","hevc_amf"):
+         return ["-rc","cqp","-qp",str(crf)]
+     if enc == "av1_amf":
+@@ -640,7 +649,7 @@ def _sync_meta(src: str, dst: str) -> bool:
+         "-Keys:CreationDate",
+         # Live Photo
+         "-Keys:ContentIdentifier",
+-        
++
+         # Th├¬m UserData fallback (iOS 17/18 Apple Photos fallback)
+         "-UserData:Make<Keys:Make",
+         "-UserData:Model<Keys:Model",
+@@ -697,7 +706,7 @@ def _run_progress(cmd, job_id, total_s, ppath):
+     procs.pop(job_id, None)
+     try: os.remove(ppath)
+     except: pass
+-    
++
+     is_oom = False
+     if proc.returncode != 0:
+         try:
+@@ -712,7 +721,7 @@ def _run_progress(cmd, job_id, total_s, ppath):
+     if proc.returncode == 0:
+         try: os.remove(log_path)
+         except: pass
+-        
++
+     return proc.returncode, is_oom
+ 
+ # ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+@@ -747,7 +756,7 @@ def _build_admin_response():
+ 
+     active_states = []
+     has_loading = False
+-    
++
+     for j in jobs.values():
+         status = j.get("status")
+         if status in ["processing", "waiting"]:
+@@ -843,7 +852,12 @@ def api_cancel(job_id):
          job["message"] = "Cancelled"
      proc = procs.get(job_id)
      if proc:
@@ -16,7 +107,7 @@ index b51053b..472bd0b 100644
          except: pass
      return jsonify({"success": True})
  
-@@ -983,10 +988,10 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
+@@ -974,10 +988,10 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
      if family not in supported:
          if out_ext == ".webm":
              enc = "libaom-av1"
@@ -29,7 +120,82 @@ index b51053b..472bd0b 100644
          family = _get_codec_family(enc)
  
      # ΓöÇΓöÇ Output path ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-@@ -1411,11 +1416,11 @@ def _social_photo_job(job_id, src: Path, preset: dict, preset_key: str):
+@@ -987,16 +1001,16 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
+         dst = OUTPUT_DIR / f"{src_stem}_{counter}{out_ext}"
+         counter += 1
+ 
+-    total_s             = _duration(str(src))
+     real_enc, enc_extra = _get_real_enc_extra(enc)
+ 
+     pfd, ppath = tempfile.mkstemp(suffix=".txt", prefix="vs_")
+     os.close(pfd)
+ 
+-    # ΓöÇΓöÇ T├¼m audio stream tß╗æt nhß║Ñt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++    # ΓöÇΓöÇ Probe source mß╗Öt lß║ºn ΓÇö lß║Ñy duration + audio streams ΓöÇΓöÇ
++    probe_data     = _probe(str(src))
++    total_s        = float(probe_data.get("format", {}).get("duration") or 0)
+     best_audio_idx = 0
+     best_audio_br  = 0
+-    probe_data     = _probe(str(src))
+     audio_streams_raw = [
+         s for s in probe_data.get("streams", [])
+         if s.get("codec_type") == "audio" and s.get("codec_name") and s.get("codec_name") != "none"
+@@ -1238,7 +1252,7 @@ def api_social():
+ @_job_guard
+ def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
+     job     = jobs[job_id]
+-    
++
+     dst_name = f"{src.stem}_{preset_key}.mp4"
+     dst      = OUTPUT_DIR / dst_name
+     counter  = 1
+@@ -1277,7 +1291,9 @@ def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
+ 
+     pfd, ppath = tempfile.mkstemp(suffix=".txt"); os.close(pfd)
+ 
+-    cmd = [FFMPEG_BIN] + _hwaccel_args(enc) + ["-i", str(src)]
++    # hwaccel_output_format cuda kh├┤ng t╞░╞íng th├¡ch vß╗¢i CPU filter (scale, fps)
++    # ΓåÆ chß╗ë enable khi kh├┤ng c├│ filter (YouTube preset)
++    cmd = [FFMPEG_BIN] + (_hwaccel_args(enc) if not filters else []) + ["-i", str(src)]
+     if filters: cmd += ["-vf", ",".join(filters)]
+     cmd += ["-c:v", enc] + _quality_args(enc, crf)
+     if "265" in enc or "hevc" in enc: cmd += ["-tag:v","hvc1"]
+@@ -1326,14 +1342,14 @@ def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
+             job["status"] = "waiting"
+             job["message"] = f"GPU full, retrying ({oom_retries}/3)..."
+             time.sleep(3)
+-        
++
+     ok = rc == 0 and dst.exists() and dst.stat().st_size > 1024
+     ela      = time.time() - t0 if t0 else 0
+     enc_time = _fmt_time(ela)
+ 
+     if ok:
+         _sync_meta(str(src), str(dst))
+-        
++
+         # Probe output
+         out_data  = _probe(str(dst))
+         out_res   = out_fps = out_audio = "N/A"
+@@ -1350,7 +1366,7 @@ def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
+                 ac = s.get("codec_name", "N/A").upper()
+                 out_audio = f"{ac}"
+                 break
+-                
++
+         job.update({
+             "status":"done","progress":100,"message":"Completed!",
+             "output":str(dst),
+@@ -1370,7 +1386,7 @@ def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
+ @_job_guard
+ def _social_photo_job(job_id, src: Path, preset: dict, preset_key: str):
+     job = jobs[job_id]
+-    
++
+     dst_name = f"{src.stem}_{preset_key}.jpg"
+     dst      = OUTPUT_DIR / dst_name
+     counter  = 1
+@@ -1400,11 +1416,11 @@ def _social_photo_job(job_id, src: Path, preset: dict, preset_key: str):
      q   = max(1, int((100 - preset["q"]) / 100 * 31))
      cmd = [FFMPEG_BIN,"-i",str(src),"-vf",vf,"-q:v",str(q),"-frames:v","1","-y",str(dst)]
      job["status"] = "waiting"
@@ -43,9 +209,21 @@ index b51053b..472bd0b 100644
          try:
              r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
              rc = r.returncode
-@@ -1536,13 +1541,13 @@ def _audio_job(job_id, src: Path, af: dict):
-     cmd = [FFMPEG_BIN,"-i",str(src),"-vn","-c:a",af["codec"]] + af["opts"] + ["-y",str(dst)]
+@@ -1434,7 +1450,7 @@ def _social_photo_job(job_id, src: Path, preset: dict, preset_key: str):
+             if s.get("codec_type") == "video":
+                 out_res = f"{s.get('width','?')}x{s.get('height','?')}"
+                 break
+-                
++
+         job.update({
+             "status":"done","progress":100,"message":"Ho├án tß║Ñt!",
+             "output":str(dst),
+@@ -1523,15 +1539,15 @@ def _audio_job(job_id, src: Path, af: dict):
+                 break
  
+     cmd = [FFMPEG_BIN,"-i",str(src),"-vn","-c:a",af["codec"]] + af["opts"] + ["-y",str(dst)]
+-    
++
      job["status"] = "waiting"
 -    job["message"] = "─Éang ─æß╗úi tß╗¢i l╞░ß╗út..."
 +    job["message"] = "Waiting in queue..."
@@ -59,16 +237,164 @@ index b51053b..472bd0b 100644
          jobs[job_id]["progress"] = 50
          try:
              r = subprocess.run(
-@@ -1681,7 +1686,7 @@ def _download_job(job_id, url, quality, audio_only,
+@@ -1567,7 +1583,7 @@ def api_download():
+     if not YTDLP_BIN: return jsonify({"error":"yt-dlp not found!"}), 400
+     data        = request.get_json()
+     url         = data.get("url","").strip()
+-    quality     = data.get("quality","1080p")
++    quality     = data.get("quality","best")
+     ao          = data.get("audio_only", False)
+     audio_fmt   = data.get("audio_fmt","m4a")
+     playlist    = data.get("playlist", False)
+@@ -1575,9 +1591,13 @@ def api_download():
+     browser     = data.get("browser","")
+     cookies_txt = data.get("cookies_txt", False)
+     output_dir  = data.get("output_dir", str(OUTPUT_DIR))
++    subs        = data.get("subs", False)
++    sub_langs   = data.get("sub_langs", "vi,en").strip() or "vi,en"
++    trim_start  = data.get("trim_start", "").strip()
++    trim_end    = data.get("trim_end",   "").strip()
+     if not output_dir.strip():
+         output_dir = str(OUTPUT_DIR)
+-        
++
+     if not url or not url.startswith("http"):
+         return jsonify({"error":"Invalid URL!"}), 400
+ 
+@@ -1592,30 +1612,39 @@ def api_download():
+     }
+     threading.Thread(
+         target=_download_job,
+-        args=(job_id,url,quality,ao,audio_fmt,playlist,browser,cookies_txt,output_dir),
++        args=(job_id,url,quality,ao,audio_fmt,playlist,browser,cookies_txt,output_dir,subs,sub_langs,trim_start,trim_end),
+         daemon=True
+     ).start()
+     return jsonify({"job_id": job_id})
+ 
+ @_job_guard
+ def _download_job(job_id, url, quality, audio_only,
+-                  audio_fmt, playlist, browser, cookies_txt, output_dir):
++                  audio_fmt, playlist, browser, cookies_txt, output_dir,
++                  subs=False, sub_langs="vi,en",
++                  trim_start="", trim_end=""):
+     job    = jobs[job_id]
+-    
++
+     dl_dir = Path(output_dir)
+     try:
+         dl_dir.mkdir(parents=True, exist_ok=True)
+     except Exception as e:
+         job.update({"status": "error", "message": f"Kh├┤ng thß╗â tß║ío th╞░ mß╗Ñc l╞░u: {e}"})
+         return
+-        
++
+     log_file = dl_dir / f"{job_id}.log"
+     job["log_path"] = str(log_file)
+     f_log = open(log_file, "w", encoding="utf-8")
+ 
+     if playlist and not job.get("playlist_titles"):
+         try:
+-            r = subprocess.run([YTDLP_BIN, "--flat-playlist", "--yes-playlist", "--print", "title", "--encoding", "utf-8", url], capture_output=True, text=True, encoding="utf-8", errors="replace")
++            cookies_file = BASE_DIR / "data" / "cookies.txt"
++            title_cmd = [YTDLP_BIN, "--flat-playlist", "--yes-playlist", "--print", "title", "--encoding", "utf-8"]
++            if cookies_txt and cookies_file.exists():
++                title_cmd += ["--cookies", str(cookies_file)]
++            elif browser and browser not in ("", "none"):
++                title_cmd += ["--cookies-from-browser", browser]
++            title_cmd.append(url)
++            r = subprocess.run(title_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+             if r.returncode == 0:
+                 job["playlist_titles"] = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+         except: pass
+@@ -1645,8 +1674,11 @@ def _download_job(job_id, url, quality, audio_only,
+     # Audio only
+     if audio_only:
+         aq = DOWNLOAD_AUDIO_QUALITY.get(audio_fmt, DOWNLOAD_AUDIO_QUALITY["m4a"])
++        # M4A: ╞░u ti├¬n m4a gß╗æc ─æß╗â tr├ính re-encode AAC
++        # MP3/FLAC/WAV: lß║Ñy bestaudio (Opus 256k > AAC 128k) ─æß╗â source chß║Ñt l╞░ß╗úng h╞ín
++        audio_src = "bestaudio[ext=m4a]/bestaudio/best" if aq["fmt"] == "m4a" else "bestaudio/best"
+         cmd += [
+-            "-f", "bestaudio[ext=m4a]/bestaudio/best",
++            "-f", audio_src,
+             "-x",
+             "--audio-format",       aq["fmt"],
+             "--audio-quality",      aq["quality"],
+@@ -1654,11 +1686,29 @@ def _download_job(job_id, url, quality, audio_only,
              "--ppa", "ThumbnailsConvertor+ffmpeg_o:-vf crop=ih:ih",
              "--add-metadata",
          ]
 -        job["message"] = f"─Éang download audio ({aq['fmt'].upper()})..."
 +        job["message"] = f"Downloading audio ({aq['fmt'].upper()})..."
      else:
-         fmt = DOWNLOAD_QUALITY.get(quality, DOWNLOAD_QUALITY["best"])
+-        fmt = DOWNLOAD_QUALITY.get(quality, DOWNLOAD_QUALITY["1080p"])
++        fmt = DOWNLOAD_QUALITY.get(quality, DOWNLOAD_QUALITY["best"])
          cmd += ["-f", fmt, "--merge-output-format", "mp4"]
-@@ -1762,19 +1767,19 @@ def _download_job(job_id, url, quality, audio_only,
+ 
++    # Subtitles (video only ΓÇö kh├┤ng ├íp dß╗Ñng cho audio extract)
++    if subs and not audio_only:
++        cmd += [
++            "--write-subs", "--write-auto-subs",
++            "--sub-langs", sub_langs,
++            "--embed-subs",
++            "--sub-format", "srt/vtt/best",
++        ]
++
++    # Time range trim ΓÇö chß╗ë tß║úi ─æ├║ng ─æoß║ín cß║ºn, kh├┤ng tß║úi cß║ú video
++    if trim_start or trim_end:
++        start_ts = trim_start if trim_start else "0"
++        end_ts   = trim_end   if trim_end   else "inf"
++        cmd += [
++            "--download-sections", f"*{start_ts}-{end_ts}",
++            "--force-keyframes-at-cuts",
++        ]
++
+     cmd.append(url)
+ 
+     proc = subprocess.Popen(
+@@ -1669,6 +1719,8 @@ def _download_job(job_id, url, quality, audio_only,
+     dl_files, total, current = [], 0, 0
+     last_line = ""
+     cookie_error = False
++    stream_idx   = -1   # -1 = ch╞░a c├│ stream n├áo; 0 = video; 1 = audio
++    stream_sizes = {}   # {stream_idx: bytes} ΓÇö ─æß╗â t├¡nh tß╗ë lß╗ç video/audio
+ 
+     # Track progress by reading file
+     f_log.close()
+@@ -1684,33 +1736,50 @@ def _download_job(job_id, url, quality, audio_only,
+                     parts   = line.split()
+                     pct_str = next((p for p in parts if "%" in p), None)
+                     if pct_str:
+-                        pct = float(pct_str.replace("%",""))
++                        pct = float(pct_str.replace("%", ""))
++
++                        # Ghi nhß║¡n k├¡ch th╞░ß╗¢c stream lß║ºn ─æß║ºu thß║Ñy
++                        if stream_idx >= 0 and stream_idx not in stream_sizes:
++                            sz = _parse_dl_size(line)
++                            if sz: stream_sizes[stream_idx] = sz
++
++                        # T├¡nh progress m╞░ß╗út: video stream chiß║┐m ~90%, audio ~10%
++                        if audio_only or stream_idx <= 0:
++                            raw_pct = int(pct) if audio_only else int(pct * 0.9)
++                        else:
++                            s0 = stream_sizes.get(0, 0)
++                            s1 = stream_sizes.get(stream_idx, 0)
++                            w0 = s0 / (s0 + s1) if s0 and s1 else 0.9
++                            raw_pct = int(w0 * 100 + pct * (1 - w0))
++
+                         if total > 0:
+-                            jobs[job_id]["progress"] = min(int((current/total)*100 + (1/total)*pct), 99)
++                            jobs[job_id]["progress"] = min(int((current/total)*100 + (1/total)*raw_pct), 99)
+                         else:
+-                            jobs[job_id]["progress"] = min(int(pct), 99)
++                            jobs[job_id]["progress"] = min(raw_pct, 99)
++
+                     speed_str = next((p for p in parts if "/s" in p), None)
+                     if speed_str:
+                         jobs[job_id]["dl_speed"] = speed_str
+                 except: pass
+             elif "[download] Destination:" in line:
++                stream_idx += 1   # -1ΓåÆ0 (video), 0ΓåÆ1 (audio)
+                 f = Path(line.replace("[download] Destination:","").strip())
                  if f not in dl_files: dl_files.append(f)
                  title = re.sub(r'\.f\d+$', '', f.stem)
                  if total > 0:
@@ -92,7 +418,13 @@ index b51053b..472bd0b 100644
              elif "Merging formats into" in line:
                  m = re.search(r'Merging formats into \"([^\"]+)\"', line)
                  if m:
-@@ -1798,7 +1803,7 @@ def _download_job(job_id, url, quality, audio_only,
+@@ -1728,11 +1797,13 @@ def _download_job(job_id, url, quality, audio_only,
+                         idx = parts.index("video") + 1
+                     current = int(parts[idx])
+                     total   = int(parts[idx+2])
++                    stream_idx   = -1   # reset stream tracking cho video mß╗¢i
++                    stream_sizes = {}
+                     title_suffix = "..."
                      if playlist and job.get("playlist_titles"):
                          if 1 <= current <= len(job["playlist_titles"]):
                              title_suffix = f": {job['playlist_titles'][current-1]}"
@@ -101,7 +433,23 @@ index b51053b..472bd0b 100644
                      if total > 0:
                          job["progress"] = min(int(((current-1)/total)*100), 99)
                  except: pass
-@@ -1842,7 +1847,7 @@ def _download_job(job_id, url, quality, audio_only,
+@@ -1759,7 +1830,7 @@ def _download_job(job_id, url, quality, audio_only,
+         try: log_file.unlink(missing_ok=True)
+         except: pass
+ 
+-    if success and dl_files:
++    if success and dl_files and not job.get("cancelled"):
+         if len(dl_files) == 1 and dl_files[0].parent.parent == dl_dir:
+             try:
+                 f = dl_files[0]
+@@ -1770,13 +1841,13 @@ def _download_job(job_id, url, quality, audio_only,
+             except: pass
+ 
+         out_res = out_fps = out_audio = out_enc = out_dur = "N/A"
+-        
++
+         if playlist and len(dl_files) > 1:
+             total_sz = sum(f.stat().st_size for f in dl_files)
              parent_dir = dl_files[0].parent
              job.update({
                  "status":"done","progress":100,
@@ -110,11 +458,285 @@ index b51053b..472bd0b 100644
                  "output":str(parent_dir),"is_dir":True,
                  "file_count":len(dl_files),
                  "sz_after":_fmt_size_bytes(total_sz),
+@@ -1792,7 +1863,7 @@ def _download_job(job_id, url, quality, audio_only,
+                     d = float(p_data["format"]["duration"])
+                     out_dur = f"{int(d//60)}:{int(d%60):02d}"
+                 except: pass
+-                
++
+                 for s in p_data.get("streams", []):
+                     if s.get("codec_type") == "video":
+                         raw = s.get("codec_name", "").lower()
+@@ -1803,7 +1874,7 @@ def _download_job(job_id, url, quality, audio_only,
+                             n, d2 = r.split("/")
+                             if int(d2): out_fps = f"{round(int(n)/int(d2),1)} fps"
+                         break
+-                        
++
+                 for s in p_data.get("streams", []):
+                     if s.get("codec_type") == "audio":
+                         ac = s.get("codec_name", "N/A").upper()
+@@ -1819,7 +1890,7 @@ def _download_job(job_id, url, quality, audio_only,
+                         out_audio = f"{ac}{brs}"
+                         break
+             except: pass
+-            
++
+             job.update({
+                 "status":"done","progress":100,"message":"Xong!",
+                 "output":str(f),"is_dir":False,
+@@ -1929,13 +2000,13 @@ def api_cleanup(job_id):
+                 p = Path(out)
+                 if p.is_file():  p.unlink(missing_ok=True)
+                 elif p.is_dir(): shutil.rmtree(p, ignore_errors=True)
+-        
++
+         # Lu├┤n xo├í log file (nß║┐u c├▓n s├│t)
+         log_path_str = job.get("log_path")
+         if log_path_str:
+             try: Path(log_path_str).unlink(missing_ok=True)
+             except: pass
+-        
++
+         log_name = job.get("log_file")
+         if log_name:
+             try: (Path(OUTPUT_DIR) / log_name).unlink(missing_ok=True)
+@@ -1965,7 +2036,7 @@ def api_ytdlp_info():
+             return jsonify({"title": url[:50]})
+     except:
+         return jsonify({"title": url[:50]})
+-        
++
+ @app.route("/api/probe", methods=["POST"])
+ def api_probe():
+     ok, msg = _check_disk_space()
+@@ -2000,10 +2071,10 @@ def api_probe():
+             if s.get("codec_type") == "video":
+                 raw = s.get("codec_name", "").lower()
+                 info["codec"] = CODEC_LABELS.get(raw, raw.upper())
+-                
++
+                 w = s.get('width', '?')
+                 h = s.get('height', '?')
+-                
++
+                 # Rotation handling
+                 rotation = 0
+                 tags = s.get("tags", {})
+@@ -2015,7 +2086,7 @@ def api_probe():
+                         if sd.get("side_data_type") == "Display Matrix":
+                             try: rotation = abs(int(sd.get("rotation", 0)))
+                             except: pass
+-                
++
+                 if rotation in (90, 270) and w != '?' and h != '?':
+                     info["res"] = f"{h}x{w}"
+                 else:
+@@ -2065,7 +2136,7 @@ def api_probe():
+         # TRß║ó Vß╗Ç T├èN FILE ─É├â UPLOAD L├èN SERVER (KH├öNG X├ôA Nß╗«A)
+         info["server_file"] = tmp_path.name
+         return jsonify(info)
+-        
++
+     except Exception as e:
+         # Nß║┐u c├│ lß╗ùi trong l├║c ─æß╗ìc, x├│a file r├íc
+         try: tmp_path.unlink()
+@@ -2160,17 +2231,18 @@ if __name__ == "__main__":
+             item('Open Web UI', on_open_web, default=True),
+             item('Exit', on_exit)
+         ))
+-        
++
+         from waitress import serve
+         threading.Thread(target=serve, args=(app,), kwargs={"host":"0.0.0.0", "port":port, "threads":8}, daemon=True).start()
+-        
++
+         import webbrowser
+         threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+-        
++
+         icon.run()
+     else:
+         import webbrowser
+         threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+ 
+         from waitress import serve
+-        serve(app, host="0.0.0.0", port=port, threads=8)
+\ No newline at end of file
++        serve(app, host="0.0.0.0", port=port, threads=8)
++
+diff --git a/app/static/css/style.css b/app/static/css/style.css
+index cbfc146..8000399 100644
+--- a/app/static/css/style.css
++++ b/app/static/css/style.css
+@@ -152,7 +152,7 @@ body {
+   padding-bottom: 80px;
+   overflow-x: hidden;
+   position: relative;
+-  background-image: 
++  background-image:
+     radial-gradient(ellipse at 50% -20%, rgba(var(--purple-rgb), 0.15), transparent 60%),
+     radial-gradient(ellipse at -20% 50%, rgba(var(--blue-rgb), 0.05), transparent 50%),
+     radial-gradient(ellipse at 120% 50%, rgba(var(--pink-rgb), 0.05), transparent 50%);
+@@ -504,20 +504,20 @@ select optgroup { background: #0a0a18; color: var(--purple); font-weight: 700; p
+   position: relative; overflow: hidden;
+   user-select: none;
+ }
+-.btn-primary { 
++.btn-primary {
+   background: linear-gradient(120deg, var(--blue), var(--purple), var(--pink), var(--purple));
+   background-size: 300% 300%;
+-  color: #fff; 
+-  box-shadow: 0 8px 24px rgba(var(--purple-rgb), 0.4); 
++  color: #fff;
++  box-shadow: 0 8px 24px rgba(var(--purple-rgb), 0.4);
+   border: 1px solid rgba(255,255,255,0.2);
+   text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+   text-transform: uppercase;
+   letter-spacing: 0.08em;
+ }
+-.btn-primary:hover { 
+-  box-shadow: 0 12px 32px rgba(var(--purple-rgb), 0.6); 
+-  transform: translateY(-2px); 
+-  animation: liquidGradient 3s ease infinite; 
++.btn-primary:hover {
++  box-shadow: 0 12px 32px rgba(var(--purple-rgb), 0.6);
++  transform: translateY(-2px);
++  animation: liquidGradient 3s ease infinite;
+ }
+ @keyframes liquidGradient {
+   0% { background-position: 0% 50%; }
+@@ -526,23 +526,23 @@ select optgroup { background: #0a0a18; color: var(--purple); font-weight: 700; p
+ }
+ .btn-primary:active { transform: scale(.97); box-shadow: 0 4px 16px rgba(var(--purple-rgb), 0.4); }
+ 
+-.btn-success { 
++.btn-success {
+   background: linear-gradient(120deg, var(--green), var(--green-d), var(--green-l), var(--green-d));
+   background-size: 300% 300%;
+-  color: #fff; 
+-  box-shadow: 0 8px 24px rgba(var(--green-rgb), .4); 
++  color: #fff;
++  box-shadow: 0 8px 24px rgba(var(--green-rgb), .4);
+   border: 1px solid rgba(255,255,255,0.2);
+ }
+-.btn-success:hover { 
+-  box-shadow: 0 12px 32px rgba(var(--green-rgb), .6); 
+-  transform: translateY(-2px); 
+-  animation: liquidGradient 3s ease infinite; 
++.btn-success:hover {
++  box-shadow: 0 12px 32px rgba(var(--green-rgb), .6);
++  transform: translateY(-2px);
++  animation: liquidGradient 3s ease infinite;
+ }
+ .btn-success:active { transform: scale(.97); }
+ 
+-.btn-outline { 
+-  background: rgba(255,255,255,.05); border: 1.5px solid rgba(255,255,255,0.15); 
+-  color: var(--text-2); font-size: 14px; padding: 14px; 
++.btn-outline {
++  background: rgba(255,255,255,.05); border: 1.5px solid rgba(255,255,255,0.15);
++  color: var(--text-2); font-size: 14px; padding: 14px;
+   backdrop-filter: blur(8px);
+ }
+ .btn-outline:hover { border-color: rgba(255,255,255,.3); color: #fff; background: rgba(255,255,255,0.1); }
+@@ -598,6 +598,8 @@ select optgroup { background: #0a0a18; color: var(--purple); font-weight: 700; p
+ .mb8  { margin-bottom: 8px }
+ .mb12 { margin-bottom: 12px }
+ .mt8  { margin-top: 8px }
++.dlmode-btn { padding: 5px 12px; border-radius: 100px; font-size: 12px; font-weight: 600; border: none; background: transparent; color: var(--text-3); cursor: pointer; transition: var(--trans); display: flex; align-items: center; gap: 5px; }
++.dlmode-btn.active { background: var(--purple); color: #fff; box-shadow: 0 2px 8px rgba(var(--purple-rgb), .4); }
+ 
+ @media (max-width: 480px) {
+   .row2        { grid-template-columns: 1fr }
 diff --git a/app/static/js/main.js b/app/static/js/main.js
-index 0d4ed3d..0bcf030 100644
+index 4943402..0bcf030 100644
 --- a/app/static/js/main.js
 +++ b/app/static/js/main.js
-@@ -483,12 +483,15 @@ async function startDownload() {
+@@ -23,14 +23,14 @@ const showModal = (title, message, isAlert = false) => {
+   return new Promise(resolve => {
+     const modal = $("custom-modal");
+     if (!modal) { resolve(isAlert ? undefined : false); return; }
+-    
++
+     $("modal-title").textContent = title;
+     $("modal-message").innerHTML = message;
+-    
++
+     const icon = $("modal-icon");
+     const btnCancel = $("modal-btn-cancel");
+     const btnOk = $("modal-btn-ok");
+-    
++
+     if (isAlert) {
+       icon.className = "modal-icon warning";
+       icon.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+@@ -275,7 +275,7 @@ async function onFileChange(input, tab) {
+     if (vf) vf.classList.toggle("hidden", socialFileType !== "video");
+     if (socialFileType !== "video") return;
+   }
+-  
++
+   setBusy(tab, true); // Disable button while uploading and probing
+   await probeFile(file, tab);
+   setBusy(tab, false); // Enable button after success
+@@ -305,7 +305,7 @@ async function probeFile(file, tab) {
+         }
+       }
+     };
+-    
++
+     xhr.onload = () => {
+       if (xhr.status === 200) {
+         try {
+@@ -326,12 +326,12 @@ async function probeFile(file, tab) {
+       }
+       resolve();
+     };
+-    
++
+     xhr.onerror = () => {
+       if (loadEl) loadEl.classList.add("hidden");
+       resolve();
+     };
+-    
++
+     xhr.send(fd);
+   });
+ }
+@@ -401,6 +401,17 @@ function selectAudioFmt(k) {
+   audioFmt = k;
+ }
+ 
++// ΓöÇΓöÇ Download mode toggle ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++let dlMode = "single";
++function setDlMode(mode) {
++  dlMode = mode;
++  $("dlmode-single").classList.toggle("active", mode === "single");
++  $("dlmode-batch").classList.toggle("active",  mode === "batch");
++  $("dl-single-row").style.display = mode === "single" ? "" : "none";
++  $("dl-batch-row").style.display  = mode === "batch"  ? "" : "none";
++  $("dl-title").style.display = "none";
++}
++
+ // ΓöÇΓöÇ Download ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ function setDlType(t) {
+   dlType = t;
+@@ -458,16 +469,29 @@ async function startAudio() {
+   fd.append("format", audioFmt);
+   await _submit("audio", "/api/audio", fd);
+ }
++
++function _parseTimeToSec(t) {
++  const parts = (t || "").trim().split(":").map(Number).reverse();
++  return (parts[0] || 0) + (parts[1] || 0) * 60 + (parts[2] || 0) * 3600;
++}
++function _secToHMS(s) {
++  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
++  return h ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`;
++}
+ async function startDownload() {
++  if (dlMode === "batch") return startBatchDownload();
    const url = $("dl-url").value.trim();
    if (!url || !url.startsWith("http")) return showErr("download", "ΓÜá∩╕Å Invalid URL!");
    setBusy("download", true); hideErr("download");
@@ -131,7 +753,18 @@ index 0d4ed3d..0bcf030 100644
    const res = await fetch("/api/download", {
      method: "POST",
      headers: { "Content-Type": "application/json" },
-@@ -520,7 +523,7 @@ async function startDownload() {
+@@ -480,6 +504,10 @@ async function startDownload() {
+       titles:      S.download.titles || [],
+       browser:     dlBrowser === "cookies_txt" ? "" : dlBrowser,
+       cookies_txt: dlBrowser === "cookies_txt",
++      subs:        $("dl-subs").checked,
++      sub_langs:   $("dl-subs-lang-val").value.trim() || "vi,en",
++      trim_start:  $("dl-trim-enable").checked ? ($("dl-trim-start").value || "").trim() : "",
++      trim_end:    $("dl-trim-enable").checked ? ($("dl-trim-end").value   || "").trim() : "",
+       output_dir:  $("dl-output-dir").value.trim()
+     }),
+   });
+@@ -495,11 +523,143 @@ async function startDownload() {
      cancelBtn.style.display = "inline-block";
      cancelBtn.onclick = async () => {
        cancelBtn.style.display = "none";
@@ -140,7 +773,152 @@ index 0d4ed3d..0bcf030 100644
      };
    }
  }
-@@ -720,6 +723,14 @@ async function fetchTitle() {
+ 
++// ΓöÇΓöÇ Batch download ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++let _batchJobs = {};   // { job_id: { url, el } }
++let _batchTimer = null;
++
++async function startBatchDownload() {
++  const text = $("dl-urls").value;
++  const urls = text.split("\n").map(u => u.trim()).filter(u => u.startsWith("http"));
++  if (!urls.length) return showErr("download", "ΓÜá∩╕Å No valid URLs found!");
++
++  hideErr("download");
++  $("btn-area-download").classList.add("hidden");
++  $("res-batch-dl").classList.remove("hidden");
++  $("batch-dl-list").innerHTML = "";
++  _batchJobs = {};
++  sv("batch-dl-summary", `0 / ${urls.length} done`);
++
++  const opts = {
++    quality:     $("dl-quality").value,
++    audio_only:  dlType === "audio",
++    audio_fmt:   $("dl-audio-fmt").value,
++    playlist:    $("dl-playlist").checked,
++    titles:      [],
++    browser:     dlBrowser === "cookies_txt" ? "" : dlBrowser,
++    cookies_txt: dlBrowser === "cookies_txt",
++    subs:        $("dl-subs").checked,
++    sub_langs:   $("dl-subs-lang-val").value.trim() || "vi,en",
++    trim_start:  ($("dl-trim-start").value || "").trim(),
++    trim_end:    ($("dl-trim-end").value   || "").trim(),
++    output_dir:  $("dl-output-dir").value.trim(),
++  };
++
++  for (const url of urls) {
++    const el = _addBatchRow(url);
++    try {
++      const res  = await fetch("/api/download", {
++        method: "POST", headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ ...opts, url }),
++      });
++      const data = await res.json();
++      if (!res.ok || !data.job_id) { _setBatchRowError(el, data.error || "Failed"); continue; }
++      _batchJobs[data.job_id] = { url, el };
++    } catch(e) {
++      _setBatchRowError(el, "Network error");
++    }
++  }
++
++  if (Object.keys(_batchJobs).length) {
++    _batchTimer = setInterval(_pollBatch, 1200);
++  }
++}
++
++function _addBatchRow(url) {
++  const short = url.length > 55 ? url.slice(0, 52) + "ΓÇª" : url;
++  const div = document.createElement("div");
++  div.style.cssText = "padding:10px 16px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px";
++  div.innerHTML = `
++    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:5px">
++      <span style="color:var(--text-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${url}">${short}</span>
++      <span class="brow-status" style="flex-shrink:0;padding:2px 8px;border-radius:100px;font-size:11px;font-weight:600;background:rgba(var(--purple-rgb),.15);color:var(--purple-l)">StartingΓÇª</span>
++    </div>
++    <div style="height:3px;background:rgba(255,255,255,.06);border-radius:100px;overflow:hidden">
++      <div class="brow-bar" style="height:100%;width:0%;background:var(--purple-l);border-radius:100px;transition:width .3s"></div>
++    </div>`;
++  $("batch-dl-list").appendChild(div);
++  return div;
++}
++
++function _setBatchRowError(el, msg) {
++  el.querySelector(".brow-status").style.cssText = "flex-shrink:0;padding:2px 8px;border-radius:100px;font-size:11px;font-weight:600;background:rgba(var(--red-rgb),.15);color:var(--red)";
++  el.querySelector(".brow-status").textContent   = "Error";
++  el.querySelector(".brow-bar").style.width      = "100%";
++  el.querySelector(".brow-bar").style.background = "var(--red)";
++}
++
++async function _pollBatch() {
++  const ids = Object.keys(_batchJobs);
++  if (!ids.length) { clearInterval(_batchTimer); _batchTimer = null; return; }
++
++  let res;
++  try {
++    res = await fetch("/api/status_batch", {
++      method: "POST", headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ job_ids: ids }),
++    });
++  } catch(e) { return; }
++  const statuses = await res.json();
++
++  let doneCount = 0;
++  for (const [jid, job] of Object.entries(_batchJobs)) {
++    const data = statuses[jid];
++    if (!data) continue;
++    const { el } = job;
++    const statusEl = el.querySelector(".brow-status");
++    const barEl    = el.querySelector(".brow-bar");
++
++    if (data.status === "done") {
++      doneCount++;
++      statusEl.style.cssText = "flex-shrink:0;padding:2px 8px;border-radius:100px;font-size:11px;font-weight:600;background:rgba(var(--green-rgb),.15);color:var(--green)";
++      statusEl.textContent   = data.sz_after ? `Γ£ô ${data.sz_after}` : "Γ£ô Done";
++      barEl.style.width      = "100%";
++      barEl.style.background = "var(--green)";
++      delete _batchJobs[jid];
++    } else if (data.status === "error") {
++      _setBatchRowError(el, data.message);
++      delete _batchJobs[jid];
++    } else if (data.status === "waiting") {
++      statusEl.textContent = "WaitingΓÇª";
++    } else {
++      statusEl.textContent   = `${data.progress || 0}%`;
++      barEl.style.width      = (data.progress || 0) + "%";
++    }
++  }
++
++  const total = ids.length;
++  const done  = total - Object.keys(_batchJobs).length;
++  sv("batch-dl-summary", `${done} / ${total} done`);
++
++  if (!Object.keys(_batchJobs).length) {
++    clearInterval(_batchTimer); _batchTimer = null;
++    sv("batch-dl-summary", `${total} / ${total} done`);
++    if (window.lucide) lucide.createIcons();
++  }
++}
++
++function resetBatchDownload() {
++  clearInterval(_batchTimer); _batchTimer = null;
++  _batchJobs = {};
++  $("res-batch-dl").classList.add("hidden");
++  $("batch-dl-list").innerHTML = "";
++  $("btn-area-download").classList.remove("hidden");
++}
++
+ function getPlatformBadge(extractorKey, isPlaylist) {
+   const key = (extractorKey || "").toLowerCase();
+   let label = (extractorKey || (isPlaylist ? "PLAYLIST" : "VIDEO")).toUpperCase();
+@@ -511,7 +671,7 @@ function getPlatformBadge(extractorKey, isPlaylist) {
+   else if (key.includes("tiktok")) { label="TIKTOK"; color="#000000"; svg=`<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="margin-right:4px;vertical-align:text-bottom"><path d="M19.59,6.69a4.83,4.83,0,0,1-3.77-4.25V2h-3.45v13.67a2.89,2.89,0,0,1-5.2,1.74,2.89,2.89,0,0,1,2.31-4.64,2.93,2.93,0,0,1,.88.13V9.4a6.84,6.84,0,0,0-1-.05A6.33,6.33,0,0,0,5,20.1a6.34,6.34,0,0,0,10.86-4.43V7.02a8.16,8.16,0,0,0,4.77,1.52V5.1A4.89,4.89,0,0,1,19.59,6.69Z"/></svg>`; }
+   else if (key.includes("soundcloud")) { label="SOUNDCLOUD"; color="#FF5500"; svg=`<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="margin-right:4px;vertical-align:text-bottom"><path d="M10.8,11.5c0-1.2-0.2-2.3-0.5-3.3c-0.2-0.6-0.5-1.2-0.9-1.8C9,5.7,8.4,5,7.7,4.5C7.3,4.2,6.9,4,6.4,3.8 C5.9,3.7,5.5,3.6,5,3.6c-1.4,0-2.7,0.5-3.6,1.4C0.5,5.9,0,7.1,0,8.5v3h10.8z M24,11.5c0-1.6-1.3-3-3-3h-1.6c-0.3-1.6-1.1-3.1-2.2-4.2 c-1.2-1.2-2.7-1.9-4.4-1.9c-0.6,0-1.2,0.1-1.8,0.3c-0.1,0-0.2,0.1-0.2,0.2v8.5H24z M11.8,11.5v-7c0-0.1-0.1-0.2-0.2-0.2 C11.3,4.2,11,4.2,10.8,4.2v7.3H11.8z"/></svg>`; }
+   else if (key.includes("instagram")) { label="INSTAGRAM"; color="#E1306C"; svg=`<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="margin-right:4px;vertical-align:text-bottom"><path d="M12,2.163c3.204,0,3.584,0.012,4.85,0.07c3.252,0.148,4.771,1.691,4.919,4.919c0.058,1.265,0.069,1.645,0.069,4.849 c0,3.205-0.012,3.584-0.069,4.849c-0.149,3.225-1.664,4.771-4.919,4.919c-1.266,0.058-1.644,0.07-4.85,0.07 c-3.204,0-3.584-0.012-4.849-0.07c-3.26-0.149-4.771-1.699-4.919-4.92c-0.058-1.265-0.07-1.644-0.07-4.849 c0-3.204,0.013-3.583,0.07-4.849c0.149-3.227,1.664-4.771,4.919-4.919C8.416,2.175,8.796,2.163,12,2.163 M12,0 C8.741,0,8.333,0.014,7.053,0.072C2.695,0.272,0.272,2.69,0.073,7.052C0.014,8.333,0,8.741,0,12c0,3.259,0.014,3.668,0.072,4.948 c0.2,4.358,2.618,6.781,6.98,6.979C8.333,23.986,8.741,24,12,24c3.259,0,3.668-0.014,4.948-0.072 c4.354-0.2,6.782-2.618,6.979-6.98C23.986,15.668,24,15.259,24,12c0-3.259-0.014-3.668-0.072-4.948 c-0.2-4.358-2.618-6.78-6.98-6.979C15.668,0.014,15.259,0,12,0L12,0z M12,5.838c-3.403,0-6.162,2.759-6.162,6.162 c0,3.403,2.759,6.162,6.162,6.162c3.403,0,6.162-2.759,6.162-6.162C18.162,8.597,15.403,5.838,12,5.838L12,5.838z M12,15.998 c-2.209,0-4-1.791-4-4c0-2.209,1.791-4,4-4s4,1.791,4,4C16,14.207,14.209,15.998,12,15.998L12,15.998z M18.406,4.155 c-0.796,0-1.44,0.645-1.44,1.44c0,0.795,0.644,1.439,1.44,1.439c0.795,0,1.439-0.644,1.439-1.439 C19.845,4.799,19.201,4.155,18.406,4.155L18.406,4.155z"/></svg>`; }
+-  
++
+   return `<span style="background: ${color}; color: #fff; padding: 2px 8px; border-radius: 100px; font-size: 10px; font-weight: 700; text-transform: uppercase; display: inline-block;">${svg}${label}</span>`;
+ }
+ 
+@@ -563,6 +723,14 @@ async function fetchTitle() {
              </div>
            </div>
          `;
@@ -155,7 +933,7 @@ index 0d4ed3d..0bcf030 100644
        }
      } else {
        el.textContent = "Failed to get title";
-@@ -732,6 +743,13 @@ let _dlTitleTimer = null;
+@@ -575,9 +743,36 @@ let _dlTitleTimer = null;
  function onUrlChange() {
    $("dl-title").style.display = "none";
    clearTimeout(_dlTitleTimer);
@@ -169,7 +947,61 @@ index 0d4ed3d..0bcf030 100644
    const url = $("dl-url").value.trim();
    if (url.startsWith("http")) _dlTitleTimer = setTimeout(fetchTitle, 800);
  }
-@@ -859,19 +877,16 @@ async function pollJob(tab) {
++function updateDlTrimHint() {
++  const startVal = ($("dl-trim-start").value || "").trim();
++  const endVal   = ($("dl-trim-end").value   || "").trim();
++  const hint     = $("dl-trim-hint");
++  if (!hint) return;
++  if (!startVal && !endVal) { hint.textContent = ""; return; }
++  const start = _parseTimeToSec(startVal);
++  const end   = _parseTimeToSec(endVal);
++  if (startVal && endVal) {
++    const dur = end - start;
++    hint.textContent = dur > 0 ? `Will download ${_secToHMS(dur)} of video` : "ΓÜá∩╕Å End must be after start";
++    hint.style.color = dur > 0 ? "var(--blue)" : "var(--red)";
++  } else if (startVal) {
++    hint.textContent = `Will download from ${startVal} to end`;
++    hint.style.color = "var(--blue)";
++  } else {
++    hint.textContent = `Will download from beginning to ${endVal}`;
++    hint.style.color = "var(--blue)";
++  }
++}
+ 
+ // ΓöÇΓöÇ Submit ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ async function _submit(tab, endpoint, fd) {
+@@ -585,10 +780,10 @@ async function _submit(tab, endpoint, fd) {
+   $("prog-"     + tab).classList.remove("hidden");
+   $("res-"      + tab).classList.add("hidden");
+   $("btn-area-" + tab).classList.add("hidden");
+-  
++
+   const bar = $("bar-" + tab); if (bar) bar.style.width = "0%";
+   const pct = $("pct-" + tab); if (pct) pct.textContent = "0%";
+-  
++
+   S[tab].t0 = Date.now();
+   const _msgEl = $("msg-" + tab); if (_msgEl) _msgEl.textContent = "Preparing...";
+   try {
+@@ -640,7 +835,7 @@ async function pollJob(tab) {
+       const outPath = data.output || "";
+       const sb = parseSize(data.sz_before), sa = parseSize(data.sz_after);
+       let pct = null; if (sb > 0 && sa > 0) pct = Math.round((1 - sa/sb) * 100);
+-      
++
+       sv("res-s-fname",  outPath.split("\\").pop().split("/").pop() || "ΓÇö");
+       sv("res-s-before", data.sz_before   || "ΓÇö");
+       sv("res-s-after",  data.sz_after    || "ΓÇö");
+@@ -673,7 +868,7 @@ async function pollJob(tab) {
+       }
+       const dlBtn = $("btn-dl-file");
+       if (dlBtn) dlBtn.classList.toggle("hidden", !!data.is_dir);
+-      
++
+       document.querySelectorAll(".res-d-detail").forEach(el => {
+         el.classList.toggle("hidden", !!data.is_dir);
+       });
+@@ -682,19 +877,16 @@ async function pollJob(tab) {
        const w = $("warn-" + tab);
        if (w) { w.textContent = data.warning; w.classList.remove("hidden"); }
      }
@@ -196,7 +1028,7 @@ index 0d4ed3d..0bcf030 100644
      $("prog-"     + tab).classList.add("hidden");
      $("btn-area-" + tab).classList.remove("hidden");
      showErr(tab, data.error || data.message || "Processing failed!", s.jobId);
-@@ -879,14 +894,7 @@ async function pollJob(tab) {
+@@ -702,14 +894,7 @@ async function pollJob(tab) {
    }
  }
  
@@ -211,7 +1043,7 @@ index 0d4ed3d..0bcf030 100644
  
  // ΓöÇΓöÇ Compress Result ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
  function showCompressResult(data) {
-@@ -955,7 +963,7 @@ function resetJob(tab) {
+@@ -778,7 +963,7 @@ function resetJob(tab) {
       "res-s-time","res-s-res","res-s-fps","res-s-audio","res-s-enc"]
        .forEach(id => sv(id, "ΓÇö"));
    } else if (tab === "download") {
@@ -220,7 +1052,23 @@ index 0d4ed3d..0bcf030 100644
      ["res-d-title","res-d-size","res-d-time","res-d-dur","res-d-res","res-d-fps","res-d-audio","res-d-enc"]
        .forEach(id => sv(id, "ΓÇö"));
      const countItem = $("res-d-count-item");
-@@ -1019,6 +1027,22 @@ function setBusy(tab, busy) {
+@@ -794,13 +979,13 @@ function resetJob(tab) {
+ // ΓöÇΓöÇ Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ function showErr(tab, msg, jobId = null) {
+   const el = $("err-" + tab);
+-  if (el) { 
++  if (el) {
+     const xSvg = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
+     el.innerHTML = `${xSvg} ${msg}`;
+     if (jobId) {
+       el.innerHTML += `<div style="margin-top:8px;"><button onclick="viewLog('${jobId}')" style="font-size:12px;padding:4px 12px;background:var(--red);border:none;cursor:pointer;color:#fff;border-radius:var(--radius-sm);font-family:inherit;font-weight:600;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> View Log</button></div>`;
+     }
+-    el.style.display = "block"; 
++    el.style.display = "block";
+   }
+ }
+ 
+@@ -842,6 +1027,22 @@ function setBusy(tab, busy) {
      if (busy) settingsCard.classList.add("disabled-block");
      else settingsCard.classList.remove("disabled-block");
    }
@@ -243,41 +1091,293 @@ index 0d4ed3d..0bcf030 100644
  }
  function fmtSize(b) {
    if (b < 1024**2) return (b/1024).toFixed(1) + " KB";
+@@ -1065,7 +1266,7 @@ function detectConnectionMode() {
+     $("conn-server-mode").classList.remove("hidden");
+     $("conn-client-mode").classList.add("hidden");
+     if ($("client-count-container")) $("client-count-container").style.display = "flex";
+-    
++
+     // Collapse by default
+     const body = $("conn-body");
+     const arrow = $("conn-arrow");
+@@ -1078,7 +1279,7 @@ function detectConnectionMode() {
+     $("conn-server-mode").classList.add("hidden");
+     $("conn-client-mode").classList.remove("hidden");
+     if ($("client-count-container")) $("client-count-container").style.display = "none";
+-    
++
+     // Collapse by default
+     const body = $("conn-body");
+     const arrow = $("conn-arrow");
+@@ -1136,7 +1337,7 @@ async function onFileChange(input, tab) {
+   if (!input.files || input.files.length === 0) return;
+   const files = Array.from(input.files);
+   // input.value = ""; // KH├öNG RESET ß╗₧ ─É├éY, TR├üNH Lß╗ûI Mß║ñT FILE TR├èN SAFARI/CHROME
+-  
++
+   S.compress.files = files.map((f, i) => ({
+     id: i,
+     file: f,
+@@ -1144,15 +1345,15 @@ async function onFileChange(input, tab) {
+     status: 'pending', // pending, probing, ready, error
+     size: f.size
+   }));
+-  
++
+   sv("vn-name-compress", `Selected ${files.length} videos`);
+-  
++
+   const drop = $("drop-compress"); const vinfo = $("vinfo-compress");
+   if (drop) drop.style.display = "none";
+   if (vinfo) vinfo.style.display = "block";
+-  
++
+   renderBatchList();
+-  
++
+   setBusy('compress', true);
+   for (let i = 0; i < S.compress.files.length; i++) {
+     await probeBatchFile(i);
+@@ -1217,7 +1418,7 @@ async function probeBatchFile(index) {
+   const fObj = S.compress.files[index];
+   fObj.status = 'probing';
+   renderBatchList();
+-  
++
+   const loadEl = $("vinfo-loading-compress");
+   loadEl.classList.remove("hidden");
+   loadEl.textContent = `Uploading file ${index+1}/${S.compress.files.length} (0%)...`;
+@@ -1246,8 +1447,8 @@ async function probeBatchFile(index) {
+             fObj.status = 'error';
+             fObj.errMsg = data.error || "No server_file";
+           }
+-        } catch(e) { 
+-          fObj.status = 'error'; 
++        } catch(e) {
++          fObj.status = 'error';
+           fObj.errMsg = "JSON Parse Error";
+         }
+       } else {
+@@ -1279,39 +1480,39 @@ async function startCompress() {
+   if (!S.compress.files || S.compress.files.length === 0) {
+     showErr('compress', "Please select video(s)!"); return;
+   }
+-  
++
+   const readyFiles = S.compress.files.filter(f => f.status === 'ready');
+   if (readyFiles.length === 0) {
+     showErr('compress', "No files are ready or currently uploading!"); return;
+   }
+-  
++
+   $("err-compress").textContent = "";
+   $("err-compress").classList.remove("show");
+-  
++
+   setBusy('compress', true);
+-  
++
+   const enc = $("enc-compress").value;
+   const fmt = $("fmt-compress").value;
+   const crf = $("crf-value").value;
+-  
++
+   S.compress.jobs = {}; // reset jobs dict
+   S.compress.batchStartTime = Date.now(); // l╞░u thß╗¥i gian bß║»t ─æß║ºu batch
+   const timerEl = $("batch-elapsed-timer");
+   if (timerEl) timerEl.textContent = "00:00";
+-  
++
+   $("prog-compress").classList.remove("hidden");
+   $("res-compress").classList.add("hidden");
+   $("btn-area-compress").classList.add("hidden");
+-  
++
+   const btnChange = $("btn-change-compress");
+   if (btnChange) btnChange.style.display = "none";
+-  
++
+   const progCountEl = $("batch-progress-count");
+   if (progCountEl) progCountEl.textContent = `(0/${readyFiles.length} videos)`;
+-  
++
+   const pList = $("batch-progress-list");
+   pList.innerHTML = '';
+-  
++
+   const filmIcon = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;color:var(--blue)"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg>`;
+   // Create UI for each file
+   pList.innerHTML = readyFiles.map((f, i) => {
+@@ -1328,12 +1529,12 @@ async function startCompress() {
+       </div>
+     `;
+   }).join('');
+-  
++
+   // Submit all requests to backend (they will queue up via lock)
+   for (let i = 0; i < readyFiles.length; i++) {
+     const fObj = readyFiles[i];
+     const id = 'prog-item-' + i;
+-    
++
+     const fd = new FormData();
+     fd.append("server_file", fObj.server_file);
+     fd.append("original_name", fObj.file.name);
+@@ -1341,7 +1542,7 @@ async function startCompress() {
+     fd.append("format", fmt);
+     fd.append("crf", crf);
+     if (muteAudio) fd.append("mute", "1");
+-    
++
+     try {
+       const res = await fetch("/api/compress", { method: "POST", body: fd });
+       const data = await res.json();
+@@ -1359,7 +1560,7 @@ async function startCompress() {
+       sv('msg-' + id, "Connection error");
+     }
+   }
+-  
++
+   // Start polling
+   if (S.compress.timer) clearInterval(S.compress.timer);
+   S.compress.timer = setInterval(pollBatchProgress, 1000);
+@@ -1464,12 +1665,12 @@ async function pollBatchProgress() {
+   const allJobIds = Object.keys(S.compress.jobs);
+   const activeJobIds = allJobIds.filter(jid => !S.compress.jobs[jid].done);
+   const doneCount = allJobIds.length - activeJobIds.length;
+-  
++
+   const progCountEl = $("batch-progress-count");
+   if (progCountEl && allJobIds.length > 0) {
+     progCountEl.textContent = `(${doneCount}/${allJobIds.length} videos)`;
+   }
+-  
++
+   if (activeJobIds.length === 0) {
+     clearInterval(S.compress.timer);
+     S.compress.timer = null;
+@@ -1484,7 +1685,7 @@ async function pollBatchProgress() {
+     renderBatchResult();
+     return;
+   }
+-  
++
+   // Cß║¡p nhß║¡t bß╗Ö ─æß║┐m giß╗¥ live mß╗ùi gi├óy
+   const _timerEl = $("batch-elapsed-timer");
+   if (_timerEl && S.compress.batchStartTime) {
+@@ -1505,7 +1706,7 @@ async function pollBatchProgress() {
+     activeJobIds.forEach(jid => {
+       const data = batchData[jid];
+       if (!data) return;
+-      
++
+       const jobMeta = S.compress.jobs[jid];
+       const uid = jobMeta.ui_id;
+ 
 diff --git a/app/templates/index.html b/app/templates/index.html
-index 71cea09..22b2a61 100644
+index 08f92ae..22b2a61 100644
 --- a/app/templates/index.html
 +++ b/app/templates/index.html
-@@ -539,23 +539,24 @@
-         <span style="font-size:11px;color:var(--text-3);white-space:nowrap">comma-separated</span>
+@@ -53,7 +53,7 @@
+           <button class="conn-copy-btn" onclick="copyUrl('http://{{ local_ip }}:5000',this)">Copy</button>
+         </div>
+         <div class="conn-tip" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 8px 12px; border-radius: var(--radius-sm); margin-top: 8px; margin-bottom: 16px;"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Access from other devices via the same WiFi/LAN</div>
+-        
++
+         <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px; margin-top: 8px;">
+           <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 8px; margin-bottom: 8px;">
+             <div style="font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 6px;"><i data-lucide="monitor" style="width:14px;height:14px;transform:translateY(-1px)"></i> ACTIVE CLIENTS</div>
+@@ -426,12 +426,24 @@
+     <div class="err" style="display:block"><i data-lucide="x-circle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> yt-dlp not installed! Place yt-dlp.exe in the app.py folder</div>
+     {% endif %}
+     <div class="card">
+-      <div class="card-title"><i data-lucide="link" style="width:18px;height:18px;vertical-align:-2px"></i> Video / audio / playlist URL</div>
+-      <div class="url-row">
++      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
++        <div class="card-title" style="margin-bottom:0"><i data-lucide="link" style="width:18px;height:18px;vertical-align:-2px"></i> Video / audio / playlist URL</div>
++        <div style="display:flex;gap:4px;background:rgba(0,0,0,.25);border:1px solid var(--card-border);border-radius:100px;padding:3px">
++          <button id="dlmode-single" class="dlmode-btn active" onclick="setDlMode('single',this)"><i data-lucide="link" style="width:13px;height:13px;vertical-align:-2px"></i> Single</button>
++          <button id="dlmode-batch"  class="dlmode-btn"        onclick="setDlMode('batch',this)"><i data-lucide="list" style="width:13px;height:13px;vertical-align:-2px"></i> Batch</button>
++        </div>
++      </div>
++      <div id="dl-single-row" class="url-row">
+         <input type="url" id="dl-url" class="dark-input" placeholder="https://youtube.com/watch?v=..." oninput="onUrlChange()">
        </div>
-       <label class="playlist-toggle" style="margin-top:8px">
--        <input type="checkbox" id="dl-trim-enable" onchange="$('dl-trim-inputs').style.display=this.checked?'block':'none';updateDlTrimHint()">
--        <div>
-+        <input type="checkbox" id="dl-trim-enable" onchange="$('dl-trim-inputs').style.display=this.checked?'block':'none';updateDlTrimHint()" disabled>
-+        <div id="dl-trim-text" style="opacity:0.4; transition:opacity 0.3s">
-           <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="scissors" style="width:16px;height:16px;vertical-align:-2px"></i> Download time range</div>
--          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Only download a portion of the video (keyframe-based cuts)</div>
-+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Only available after video duration is loaded</div>
++      <div id="dl-batch-row" style="display:none">
++        <textarea id="dl-urls" class="dark-input" rows="5"
++          placeholder="One URL per line:&#10;https://youtube.com/watch?v=...&#10;https://tiktok.com/@user/video/..."
++          style="width:100%;box-sizing:border-box;resize:vertical;font-size:13px;line-height:1.6;font-family:inherit"></textarea>
++        <div style="font-size:11px;color:var(--text-3);margin-top:4px"><i data-lucide="info" style="width:12px;height:12px;vertical-align:-1px;color:var(--blue)"></i> Each URL on a separate line. Playlist and quality settings apply to all.</div>
++      </div>
+       <div class="dl-title-preview" id="dl-title"></div>
+-      
++
+       {% if is_server %}
+       <div class="card-title" style="margin-top:16px"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Save folder</div>
+       <div id="folder-display"
+@@ -471,17 +483,17 @@
+         <div>
+           <div class="cs-wrap" id="cs-dl-quality">
+             <div class="cs-trigger" onclick="toggleCS('cs-dl-quality')">
+-              <span class="cs-val" id="cs-dl-quality-val"><i data-lucide="monitor" style="width:14px;height:14px;vertical-align:-2px"></i> 1080p (Recommended)</span>
++              <span class="cs-val" id="cs-dl-quality-val"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</span>
+               <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+             </div>
+             <div class="cs-dropdown">
+-              <div class="cs-option" data-value="best" onclick="pickDlQuality('best', this.innerHTML)"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</div>
+-              <div class="cs-option selected" data-value="1080p" onclick="pickDlQuality('1080p', this.innerHTML)"><i data-lucide="monitor" style="width:14px;height:14px;vertical-align:-2px"></i> 1080p (Recommended)</div>
++              <div class="cs-option selected" data-value="best" onclick="pickDlQuality('best', this.innerHTML)"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</div>
++              <div class="cs-option" data-value="1080p" onclick="pickDlQuality('1080p', this.innerHTML)"><i data-lucide="monitor" style="width:14px;height:14px;vertical-align:-2px"></i> 1080p</div>
+               <div class="cs-option" data-value="720p" onclick="pickDlQuality('720p', this.innerHTML)"><i data-lucide="smartphone" style="width:14px;height:14px;vertical-align:-2px"></i> 720p</div>
+               <div class="cs-option" data-value="480p" onclick="pickDlQuality('480p', this.innerHTML)"><i data-lucide="save" style="width:14px;height:14px;vertical-align:-2px"></i> 480p</div>
+             </div>
+           </div>
+-          <input type="hidden" id="dl-quality" value="1080p">
++          <input type="hidden" id="dl-quality" value="best">
+         </div>
+       </div>
+       <div id="dl-audio-opts" class="hidden">
+@@ -514,6 +526,39 @@
+           <div style="font-size:11px;color:var(--text-3);margin-top:2px">Download all videos in the playlist</div>
          </div>
        </label>
-       <div id="dl-trim-inputs" style="display:none;margin-top:6px;padding:10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
-         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-           <div>
-             <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="play" style="width:11px;height:11px;vertical-align:-1px"></i> Start</div>
--            <input type="text" id="dl-trim-start" class="dark-input" placeholder="00:00:00" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
++      <label class="playlist-toggle" style="margin-top:8px">
++        <input type="checkbox" id="dl-subs" onchange="$('dl-subs-lang').style.display=this.checked?'flex':'none'">
++        <div>
++          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="subtitles" style="width:16px;height:16px;vertical-align:-2px"></i> Download subtitles</div>
++          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Embed subtitles into video file</div>
++        </div>
++      </label>
++      <div id="dl-subs-lang" style="display:none;align-items:center;gap:8px;margin-top:6px;padding:8px 10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
++        <span style="font-size:12px;color:var(--text-3);white-space:nowrap"><i data-lucide="languages" style="width:14px;height:14px;vertical-align:-2px"></i> Languages:</span>
++        <input type="text" id="dl-subs-lang-val" class="dark-input" placeholder="vi,en" value="vi,en" style="flex:1;padding:6px 10px;font-size:13px">
++        <span style="font-size:11px;color:var(--text-3);white-space:nowrap">comma-separated</span>
++      </div>
++      <label class="playlist-toggle" style="margin-top:8px">
++        <input type="checkbox" id="dl-trim-enable" onchange="$('dl-trim-inputs').style.display=this.checked?'block':'none';updateDlTrimHint()" disabled>
++        <div id="dl-trim-text" style="opacity:0.4; transition:opacity 0.3s">
++          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="scissors" style="width:16px;height:16px;vertical-align:-2px"></i> Download time range</div>
++          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Only available after video duration is loaded</div>
++        </div>
++      </label>
++      <div id="dl-trim-inputs" style="display:none;margin-top:6px;padding:10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
++        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
++          <div>
++            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="play" style="width:11px;height:11px;vertical-align:-1px"></i> Start</div>
 +            <input type="text" id="dl-trim-start" class="dark-input" placeholder="e.g. 1:30 or 90" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
-           </div>
-           <div>
-             <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="square" style="width:11px;height:11px;vertical-align:-1px"></i> End</div>
--            <input type="text" id="dl-trim-end" class="dark-input" placeholder="00:00:00" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
++          </div>
++          <div>
++            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="square" style="width:11px;height:11px;vertical-align:-1px"></i> End</div>
 +            <input type="text" id="dl-trim-end" class="dark-input" placeholder="e.g. 2:45" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
-           </div>
-         </div>
++          </div>
++        </div>
 +        <div style="font-size:10px;color:var(--text-3);text-align:center;margin-top:6px;font-style:italic">Format: Seconds (e.g. 90) or MM:SS (e.g. 1:30) or HH:MM:SS</div>
-         <div id="dl-trim-hint" style="margin-top:5px;font-size:11px;color:var(--text-3);text-align:center;min-height:16px"></div>
-       </div>
++        <div id="dl-trim-hint" style="margin-top:5px;font-size:11px;color:var(--text-3);text-align:center;min-height:16px"></div>
++      </div>
        <div class="section-label" style="margin-top:12px"><i data-lucide="cookie" style="width:18px;height:18px;vertical-align:-2px"></i> Cookie</div>
-@@ -595,8 +596,8 @@
+       <div class="cookie-status" id="cookie-file-status"></div>
+       <div class="preset-grid preset-grid-3" style="gap:6px">
+@@ -551,8 +596,8 @@
        <div class="prog-msg" id="msg-download"></div>
        <div class="prog-track"><div class="prog-fill" id="bar-download"></div></div>
        <div class="prog-meta"><span id="pct-download">0%</span><span id="eta-download"></span></div>
@@ -288,7 +1388,7 @@ index 71cea09..22b2a61 100644
        </div>
      </div>
      <div id="res-download" class="hidden">
-@@ -631,18 +632,7 @@
+@@ -587,16 +632,18 @@
          <button class="btn btn-outline" onclick="resetJob('download')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New download</button>
        </div>
      </div>
@@ -298,13 +1398,29 @@ index 71cea09..22b2a61 100644
 -        <div class="prog-msg" id="paused-d-msg"></div>
 -        <div class="prog-track"><div class="prog-fill" id="paused-d-bar"></div></div>
 -        <div class="prog-meta"><span id="paused-d-pct">0%</span><span>ΓÇö paused ┬╖ yt-dlp will resume from here</span></div>
--      </div>
++
++    <!-- Batch download result list -->
++    <div id="res-batch-dl" class="hidden">
++      <div class="result-box" style="padding:0;overflow:hidden">
++        <div style="padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.06);font-size:12px;font-weight:600;color:var(--text-2);display:flex;justify-content:space-between;align-items:center">
++          <span><i data-lucide="list" style="width:14px;height:14px;vertical-align:-2px"></i> Batch download</span>
++          <span id="batch-dl-summary" style="color:var(--text-3)"></span>
++        </div>
++        <div id="batch-dl-list" style="max-height:400px;overflow-y:auto"></div>
+       </div>
 -      <div class="action-area" style="margin-top:12px">
 -        <button class="btn btn-primary" onclick="resumeDownload()"><i data-lucide="play" style="width:16px;height:16px;vertical-align:-2px"></i> Resume download</button>
 -        <button class="btn btn-outline" onclick="cancelPausedDownload()"><i data-lucide="x" style="width:16px;height:16px;vertical-align:-2px"></i> Cancel completely</button>
--      </div>
--    </div>
++      <div class="action-area">
++        <button class="btn btn-outline" onclick="resetBatchDownload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New batch</button>
+       </div>
+     </div>
+     <div id="btn-area-download" class="mt8">
+@@ -649,4 +696,5 @@
+     </div>
+   </div>
+ </body>
+-</html>
+\ No newline at end of file
++</html>
 +
-     <!-- Batch download result list -->
-     <div id="res-batch-dl" class="hidden">
-       <div class="result-box" style="padding:0;overflow:hidden">
