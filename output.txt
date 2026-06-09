@@ -7,6 +7,8 @@ PROJECT TREE
 │   │   │   ├── style.css
 │   │   ├── js/
 │   │   │   ├── main.js
+│   ├── templates/
+│   │   ├── index.html
 
 
 ===== FILE: app.py =====
@@ -219,6 +221,10 @@ AUDIO_LABELS = {
 
 jobs: dict = {}
 procs: dict = {}
+_sync_events: dict = {}   # {job_id: threading.Event} — kept separate to avoid JSON serialization issues
+_jobs_lock    = threading.RLock()   # protects jobs dict iteration + compound writes
+_output_lock  = threading.Lock()    # protects output filename dedup
+_clients_lock = threading.RLock()   # protects active_clients dict
 active_clients: dict = {}
 # ── Encoder sets ──────────────────────────────────────────────
 _GPU_ENCS = frozenset({
@@ -747,7 +753,7 @@ def _sync_meta(src: str, dst: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 # PROGRESS RUNNER
 # ══════════════════════════════════════════════════════════════
-def _run_progress(cmd, job_id, total_s, ppath):
+def _run_progress(cmd, job_id, total_s, ppath, timeout_sec=7200):
     job = jobs.get(job_id, {})
     stem = "unknown"
     if "src_name" in job:
@@ -758,19 +764,45 @@ def _run_progress(cmd, job_id, total_s, ppath):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_name = f"ffmpeg_err_{stem}_{ts}.log"
     log_path = Path(OUTPUT_DIR) / log_name
-    job["log_file"] = log_name
+    with _jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["log_file"] = log_name
+    deadline = time.time() + timeout_sec
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("CMD: " + " ".join(cmd) + "\n\n")
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=f)
         procs[job_id] = proc
-        while True:
-            time.sleep(0.5)
-            cur, done = _read_progress(ppath)
-            if total_s > 0 and cur > 0:
-                jobs[job_id]["progress"] = min(int(cur/total_s*100), 99)
-            if done or proc.poll() is not None: break
-        proc.wait()
-    procs.pop(job_id, None)
+        try:
+            while True:
+                time.sleep(0.5)
+                # Cancellation check — kill immediately and break
+                if jobs.get(job_id, {}).get("cancelled"):
+                    try:
+                        if os.name == 'nt':
+                            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                        else:
+                            proc.terminate()
+                            try: proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired: proc.kill()
+                    except: pass
+                    break
+                # Timeout guard
+                if time.time() > deadline:
+                    try: proc.kill()
+                    except: pass
+                    with _jobs_lock:
+                        jobs[job_id].update({"status": "error", "message": f"FFmpeg timeout after {timeout_sec//3600}h"})
+                    break
+                cur, done = _read_progress(ppath)
+                if total_s > 0 and cur > 0:
+                    with _jobs_lock:
+                        jobs[job_id]["progress"] = min(int(cur/total_s*100), 99)
+                if done or proc.poll() is not None:
+                    break
+        finally:
+            proc.wait()
+            procs.pop(job_id, None)
     try: os.remove(ppath)
     except: pass
 
@@ -816,10 +848,12 @@ def index():
         default_out_dir=str(OUTPUT_DIR.resolve()))
 
 def _build_admin_response():
-    now = time.time()
-    expired = [cid for cid, info in active_clients.items() if now - info["last_seen"] > 5]
-    for cid in expired:
-        active_clients.pop(cid, None)
+    with _clients_lock:
+        now = time.time()
+        expired = [cid for cid, info in active_clients.items() if now - info["last_seen"] > 5]
+        for cid in expired:
+            active_clients.pop(cid, None)
+        clients_snapshot = list(active_clients.items())
 
     active_states = []
     has_loading = False
@@ -858,7 +892,7 @@ def _build_admin_response():
                 "filename": info["filename"],
                 "progress": info["progress"]
             }
-            for cid, info in active_clients.items()
+            for cid, info in clients_snapshot
         ]
     }
 
@@ -867,32 +901,33 @@ def api_ping():
     data = request.get_json() or {}
     client_id = data.get("client_id")
     if client_id:
-        os_info = data.get("os", "Unknown OS")
-        browser_info = data.get("browser", "Unknown Browser")
+        with _clients_lock:
+            os_info = data.get("os", "Unknown OS")
+            browser_info = data.get("browser", "Unknown Browser")
 
-        if parse_user_agent:
-            ua = parse_user_agent(request.user_agent.string)
-            if ua.os.family and ua.os.family != "Other":
-                os_info = ua.os.family
-            if ua.browser.family and ua.browser.family != "Other":
-                browser_info = ua.browser.family
-        else:
-            if os_info == "Unknown OS" and request.user_agent.platform:
-                os_info = request.user_agent.platform.capitalize()
-            if browser_info == "Unknown Browser" and request.user_agent.browser:
-                browser_info = request.user_agent.browser.capitalize()
+            if parse_user_agent:
+                ua = parse_user_agent(request.user_agent.string)
+                if ua.os.family and ua.os.family != "Other":
+                    os_info = ua.os.family
+                if ua.browser.family and ua.browser.family != "Other":
+                    browser_info = ua.browser.family
+            else:
+                if os_info == "Unknown OS" and request.user_agent.platform:
+                    os_info = request.user_agent.platform.capitalize()
+                if browser_info == "Unknown Browser" and request.user_agent.browser:
+                    browser_info = request.user_agent.browser.capitalize()
 
-        active_clients[client_id] = {
-            "ip": request.remote_addr,
-            "os": os_info,
-            "browser": browser_info,
-            "raw_ua": request.user_agent.string,
-            "status": data.get("status", "idle"),
-            "tab": data.get("tab", "compress"),
-            "filename": data.get("filename", ""),
-            "progress": data.get("progress", ""),
-            "last_seen": time.time()
-        }
+            active_clients[client_id] = {
+                "ip": request.remote_addr,
+                "os": os_info,
+                "browser": browser_info,
+                "raw_ua": request.user_agent.string,
+                "status": data.get("status", "idle"),
+                "tab": data.get("tab", "compress"),
+                "filename": data.get("filename", ""),
+                "progress": data.get("progress", ""),
+                "last_seen": time.time()
+            }
     return jsonify({"status": "ok", **_build_admin_response()})
 
 @app.route("/api/admin/clients")
@@ -906,19 +941,23 @@ def api_check_cookies():
 
 @app.route("/api/cancel/<job_id>", methods=["POST"])
 def api_cancel(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error":"Process not found!"}), 404
-    job["cancelled"] = True
-    job["status"]  = "error"
-    job["message"] = "Cancelled"
+    with _jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error":"Process not found!"}), 404
+        job["cancelled"] = True
+        job["status"]    = "error"
+        job["message"]   = "Cancelled"
     proc = procs.get(job_id)
     if proc:
         try:
             if os.name == 'nt':
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             else:
                 proc.terminate()
+                try: proc.wait(timeout=5)
+                except subprocess.TimeoutExpired: proc.kill()
         except: pass
     return jsonify({"success": True})
 
@@ -950,6 +989,8 @@ def api_open_folder():
     path = data.get("path")
     if not path or not Path(path).exists():
         return jsonify({"error": "Directory does not exist"}), 400
+    if not Path(path).is_dir():
+        return jsonify({"error": "Path is not a directory"}), 400
     try:
         if os.name == 'nt':
             os.startfile(path)
@@ -993,40 +1034,39 @@ def api_compress():
     else:
         f = request.files.get("file")
         if not f: return jsonify({"error":"No file uploaded!"}), 400
-        orig_name = secure_filename(f.filename)
+        orig_name = re.sub(r'[\\/*?:"<>|]', "_", f.filename)
         orig_ext = Path(orig_name).suffix.lower()
         if orig_ext not in VIDEO_EXTS:
             return jsonify({"error":"Only videos are supported!"}), 400
         if out_ext == "original": out_ext = orig_ext
 
         job_id   = uuid.uuid4().hex[:8]
-        src_path = UPLOAD_DIR / orig_name
-        counter = 1
-        while src_path.exists():
-            src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{counter}{Path(orig_name).suffix}"
-            counter += 1
+        src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{job_id}{Path(orig_name).suffix}"
         f.save(str(src_path))
 
     global current_compress_batch_id, active_compress_batch_settings, active_client_batch_id
-    has_active = any(j.get("type") == "compress" and j.get("status") in ["processing", "waiting"] for j in list(jobs.values()))
-
     client_batch_id = request.form.get("client_batch_id", "")
 
-    if has_active:
-        if not client_batch_id or client_batch_id != active_client_batch_id:
-            try: src_path.unlink()
-            except: pass
-            return jsonify({"error": "System is busy processing another batch!"}), 429
-    elif client_batch_id != active_client_batch_id:
-        current_compress_batch_id += 1
-        active_client_batch_id = client_batch_id
-        active_compress_batch_settings = {
-            "encoder": enc,
-            "format": request.form.get("format", "original"),
-            "crf": crf,
-            "mute": mute
-        }
+    # Atomic: check active state + update batch globals in one lock
+    with _jobs_lock:
+        has_active = any(j.get("type") == "compress" and j.get("status") in ["processing", "waiting"] for j in jobs.values())
+        if has_active:
+            if not client_batch_id or client_batch_id != active_client_batch_id:
+                try: src_path.unlink()
+                except: pass
+                return jsonify({"error": "System is busy processing another batch!"}), 429
+        elif client_batch_id != active_client_batch_id:
+            current_compress_batch_id += 1
+            active_client_batch_id = client_batch_id
+            active_compress_batch_settings = {
+                "encoder": enc,
+                "format": request.form.get("format", "original"),
+                "crf": crf,
+                "mute": mute
+            }
+        batch_id_snapshot = current_compress_batch_id
 
+    # ui_meta outside lock — may call ffprobe subprocess
     ui_meta = {}
     try:
         ui_meta_str = request.form.get("ui_meta", "{}")
@@ -1038,15 +1078,16 @@ def api_compress():
     if not ui_meta and src_path and src_path.exists():
         ui_meta = _extract_ui_meta(src_path)
 
-    jobs[job_id] = {
-        "status":"processing","progress":0,
-        "message":"Preparing...",
-        "output":None,"src_name":orig_name,"type":"compress",
-        "batch_id": current_compress_batch_id,
-        "ui_meta": ui_meta,
-        "src_size": src_path.stat().st_size if src_path and src_path.exists() else 0,
-        "created_at": time.time()
-    }
+    with _jobs_lock:
+        jobs[job_id] = {
+            "status":"processing","progress":0,
+            "message":"Preparing...",
+            "output":None,"src_name":orig_name,"type":"compress",
+            "batch_id": batch_id_snapshot,
+            "ui_meta": ui_meta,
+            "src_size": src_path.stat().st_size if src_path and src_path.exists() else 0,
+            "created_at": time.time()
+        }
     threading.Thread(
         target=_compress_job,
         args=(job_id, src_path, enc, crf, out_ext, mute),  # ← thêm mute
@@ -1056,11 +1097,11 @@ def api_compress():
 
 @app.route("/api/active_compress_batch", methods=["GET"])
 def api_active_compress_batch():
-    has_active = any(j.get("type") == "compress" and j.get("status") in ["processing", "waiting"] for j in list(jobs.values()))
-    if not has_active:
-        return jsonify({"active": False, "jobs": {}})
-
-    batch_jobs = {jid: j for jid, j in jobs.items() if j.get("type") == "compress" and j.get("batch_id") == current_compress_batch_id}
+    with _jobs_lock:
+        has_active = any(j.get("type") == "compress" and j.get("status") in ["processing", "waiting"] for j in list(jobs.values()))
+        if not has_active:
+            return jsonify({"active": False, "jobs": {}})
+        batch_jobs = {jid: dict(j) for jid, j in jobs.items() if j.get("type") == "compress" and j.get("batch_id") == current_compress_batch_id}
     return jsonify({
         "active": True,
         "jobs": batch_jobs,
@@ -1069,20 +1110,60 @@ def api_active_compress_batch():
     })
 
 
+_MAX_PATH = 200  # safe margin under Windows MAX_PATH (260)
+
+def _check_path_len(p: Path, job_id: str) -> bool:
+    """Returns False and sets job error if path exceeds Windows MAX_PATH limit."""
+    if os.name == "nt" and len(str(p)) > _MAX_PATH:
+        with _jobs_lock:
+            jobs[job_id].update({
+                "status": "error",
+                "message": f"⚠️ Output path too long ({len(str(p))} chars). Move the output folder closer to drive root."
+            })
+        return False
+    return True
+
+def _unique_output_path(stem: str, ext: str, base_dir: Path = None) -> Path:
+    """Thread-safe output filename reservation via _output_lock + touch()."""
+    base_dir = base_dir or OUTPUT_DIR
+    with _output_lock:
+        dst = base_dir / f"{stem}{ext}"
+        counter = 2
+        while True:
+            try:
+                dst.touch(exist_ok=False)   # atomic: raises FileExistsError if taken
+                return dst
+            except FileExistsError:
+                dst = base_dir / f"{stem}_{counter}{ext}"
+                counter += 1
+
 def _job_guard(fn):
     """Bắt exception không xử lý trong job thread → job không bị stuck 'processing'."""
     def wrapper(job_id, *args, **kwargs):
         try:
             fn(job_id, *args, **kwargs)
         except Exception as e:
-            if job_id in jobs:
-                jobs[job_id].update({"status": "error", "message": f"Error: {e}"})
+            import traceback
+            with _jobs_lock:
+                if job_id in jobs:
+                    jobs[job_id].update({"status": "error", "message": f"Error: {e}"})
+                else:
+                    print(f"[job_guard] job {job_id} missing on error: {e}\n{traceback.format_exc()}",
+                          file=sys.stderr)
+        finally:
+            # Signal sync download waiter (if any) when job finishes
+            ev = _sync_events.pop(job_id, None)
+            if ev:
+                ev.set()
     return wrapper
 
 @_job_guard
 def _compress_job(job_id, src: Path, enc: str, crf: int,
                   out_ext: str, mute: bool = False):
-    job    = jobs[job_id]
+    with _jobs_lock:
+        if job_id not in jobs:
+            return
+        job = jobs[job_id]
     family = _get_codec_family(enc)
     # t0 sẽ được đặt sau khi được cấp slot GPU — không tính thời gian chờ hàng đợi
     t0     = None
@@ -1107,12 +1188,12 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
             job["message"] = f"<i data-lucide=\"alert-triangle\" style=\"width:16px;height:16px;vertical-align:-2px;color:var(--red)\"></i> {out_ext.upper()} does not support {family.upper()} → switching to H.264"
         family = _get_codec_family(enc)
 
-    # ── Output path ───────────────────────────────────────
-    dst = OUTPUT_DIR / f"{src_stem}{out_ext}"
-    counter = 1
-    while dst.exists():
-        dst = OUTPUT_DIR / f"{src_stem}_{counter}{out_ext}"
-        counter += 1
+    # ── Output path (atomic reserve to prevent race on same filename) ─
+    dst = _unique_output_path(src_stem, out_ext)
+    if not _check_path_len(dst, job_id):
+        try: src.unlink()
+        except: pass
+        return
 
     real_enc, enc_extra = _get_real_enc_extra(enc)
 
@@ -1199,19 +1280,22 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
 
     oom_retries = 0
     while True:
-        job["status"] = "waiting"
-        job["message"] = "Waiting in queue..."
+        with _jobs_lock:
+            job["status"]  = "waiting"
+            job["message"] = "Waiting in queue..."
         with _pick_sem(real_enc):
             if job.get("cancelled"): return
-            job["status"] = "processing"
-            job["message"] = f"Encoding ({real_enc}){av1_warning}{' — no audio' if mute else ''}..."
+            with _jobs_lock:
+                job["status"]  = "processing"
+                job["message"] = f"Encoding ({real_enc}){av1_warning}{' — no audio' if mute else ''}..."
             t0 = time.time()  # Bắt đầu đo từ đây — sau khi được cấp slot
             try:
                 rc, is_oom = _run_progress(cmd, job_id, total_s, ppath)
             except Exception as e:
                 rc = -1
                 is_oom = False
-                job.update({"status": "error", "message": f"Error: {e}"})
+                with _jobs_lock:
+                    job.update({"status": "error", "message": f"Error: {e}"})
 
             if rc != 0 and is_oom:
                 pass
@@ -1222,12 +1306,14 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
             if job.get("cancelled"): return
             oom_retries += 1
             if oom_retries >= 3:
-                job.update({"status": "error", "message": "Insufficient VRAM — failed after 3 retries."})
+                with _jobs_lock:
+                    job.update({"status": "error", "message": "Insufficient VRAM — failed after 3 retries."})
                 try: dst.unlink()
                 except: pass
                 return
-            job["status"] = "waiting"
-            job["message"] = f"GPU full, retrying ({oom_retries}/3)..."
+            with _jobs_lock:
+                job["status"]  = "waiting"
+                job["message"] = f"GPU full, retrying ({oom_retries}/3)..."
             time.sleep(3)
 
     ok = rc == 0 and dst.exists() and dst.stat().st_size > 1024
@@ -1271,6 +1357,8 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
                         if br_tag:
                             try: br_int = int(br_tag)
                             except: pass
+                    if br_int < 10000:          # MP4/AAC thường không có stream-level bitrate
+                        br_int = target_kbps * 1000
                     brs       = f" {br_int//1000}kbps" if br_int > 10000 else ""
                     out_audio = f"{ac}{brs}"
                     break
@@ -1291,10 +1379,12 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
         }
         if family == "av1" and av1_warning:
             result["warning"] = "<i data-lucide=\"alert-triangle\" style=\"width:16px;height:16px;vertical-align:-2px;color:var(--red)\"></i> AV1 does not support MOV format — auto-converted to MP4"
-        job.update(result)
+        with _jobs_lock:
+            job.update(result)
     else:
-        if not job.get("cancelled"):
-            job.update({"status": "error", "message": "Compression failed!"})
+        with _jobs_lock:
+            if not job.get("cancelled"):
+                job.update({"status": "error", "message": "Compression failed!"})
         try: dst.unlink()
         except: pass
 
@@ -1330,7 +1420,7 @@ def api_social():
     else:
         f = request.files.get("file")
         if not f: return jsonify({"error":"No file uploaded!"}), 400
-        orig_name = secure_filename(f.filename)
+        orig_name = re.sub(r'[\\/*?:"<>|]', "_", f.filename)
         ext = Path(orig_name).suffix.lower()
         if ftype=="video" and ext not in VIDEO_EXTS:
             return jsonify({"error":"This preset is for videos!"}), 400
@@ -1338,11 +1428,7 @@ def api_social():
             return jsonify({"error":"This preset is for photos!"}), 400
 
         job_id   = uuid.uuid4().hex[:8]
-        src_path = UPLOAD_DIR / orig_name
-        counter = 1
-        while src_path.exists():
-            src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{counter}{Path(orig_name).suffix}"
-            counter += 1
+        src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{job_id}{Path(orig_name).suffix}"
         f.save(str(src_path))
 
     jobs[job_id] = {
@@ -1381,6 +1467,11 @@ def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
     while dst.exists():
         dst = OUTPUT_DIR / f"{src.stem}_{preset_key}_{counter}.mp4"
         counter += 1
+
+    if not _check_path_len(dst, job_id):
+        try: src.unlink()
+        except: pass
+        return
 
     total_s = _duration(str(src))
 
@@ -1620,18 +1711,14 @@ def api_audio():
     else:
         f = request.files.get("file")
         if not f: return jsonify({"error":"No file uploaded!"}), 400
-        orig_name = secure_filename(f.filename)
+        orig_name = re.sub(r'[\\/*?:"<>|]', "_", f.filename)
         ext = Path(orig_name).suffix.lower()
         if ext not in VIDEO_EXTS:
             return jsonify({"error":"Only videos are supported!"}), 400
 
         af      = AUDIO_FORMATS.get(fmt, AUDIO_FORMATS["mp3"])
         job_id  = uuid.uuid4().hex[:8]
-        src_path = UPLOAD_DIR / orig_name
-        counter = 1
-        while src_path.exists():
-            src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{counter}{Path(orig_name).suffix}"
-            counter += 1
+        src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{job_id}{Path(orig_name).suffix}"
         f.save(str(src_path))
 
     jobs[job_id] = {
@@ -1659,6 +1746,11 @@ def _audio_job(job_id, src: Path, af: dict):
             if s.get("codec_type") == "audio":
                 dst = OUTPUT_DIR / f"{job_id}_audio{CODEC_EXT_MAP.get(s.get('codec_name','aac'),'.m4a')}"
                 break
+
+    if not _check_path_len(dst, job_id):
+        try: src.unlink()
+        except: pass
+        return
 
     cmd = [FFMPEG_BIN,"-i",str(src),"-vn","-c:a",af["codec"]] + af["opts"] + ["-y",str(dst)]
 
@@ -1725,13 +1817,15 @@ def api_download():
         return jsonify({"error":"Invalid URL!"}), 400
 
     job_id = uuid.uuid4().hex[:8]
+    if sync:
+        _sync_events[job_id] = threading.Event()
     jobs[job_id] = {
         "status":"processing","progress":0,
         "message":"Fetching info...",
         "output":None,"type":"download","url":url,"playlist":playlist,
         "playlist_titles": playlist_titles,
         "out_dir": output_dir,
-        "created_at": time.time()
+        "created_at": time.time(),
     }
     threading.Thread(
         target=_download_job,
@@ -1740,8 +1834,10 @@ def api_download():
     ).start()
 
     if sync:
-        while jobs[job_id]["status"] not in ["done", "error"]:
-            time.sleep(1.0)
+        _SYNC_TIMEOUT = 300  # 5 min — ample for LAN short videos; prevents thread exhaustion
+        if not _sync_events[job_id].wait(timeout=_SYNC_TIMEOUT):
+            return Response(f"Download timeout after {_SYNC_TIMEOUT}s",
+                            status=408, mimetype="text/plain")
 
         job = jobs[job_id]
         if job["status"] == "error":
@@ -1768,6 +1864,10 @@ def _download_job(job_id, url, quality, audio_only,
         dl_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         job.update({"status": "error", "message": f"Cannot create output folder: {e}"})
+        return
+
+    if os.name == "nt" and len(str(dl_dir / "x.mp4")) > _MAX_PATH:
+        job.update({"status": "error", "message": f"⚠️ Output folder path too long ({len(str(dl_dir))} chars). Move folder closer to drive root."})
         return
 
     log_file = dl_dir / f"{job_id}.log"
@@ -2188,12 +2288,9 @@ def api_probe():
     f = request.files.get("file")
     if not f: return jsonify({"error": "No file"}), 400
 
-    orig_name = secure_filename(f.filename)
-    tmp_path = UPLOAD_DIR / orig_name
-    counter = 1
-    while tmp_path.exists():
-        tmp_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{counter}{Path(orig_name).suffix}"
-        counter += 1
+    orig_name = re.sub(r'[\\/*?:"<>|]', "_", f.filename)
+    uid = uuid.uuid4().hex[:8]
+    tmp_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{uid}{Path(orig_name).suffix}"
     f.save(str(tmp_path))
 
     try:
@@ -2219,13 +2316,12 @@ def _auto_cleanup():
         try:
             now = time.time()
             # Dọn dẹp jobs cũ > 7 ngày
-            to_remove = []
-            for jid, j in list(jobs.items()):
-                if now - j.get("created_at", now) > 7 * 24 * 3600:
-                    to_remove.append(jid)
-            for jid in to_remove:
-                jobs.pop(jid, None)
-                procs.pop(jid, None)
+            with _jobs_lock:
+                to_remove = [jid for jid, j in jobs.items()
+                             if now - j.get("created_at", now) > 7 * 24 * 3600]
+                for jid in to_remove:
+                    jobs.pop(jid, None)
+                    procs.pop(jid, None)
 
             # Dọn dẹp uploads & outputs > 7 ngày
             for d in [UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR]:
@@ -2927,7 +3023,7 @@ select optgroup { background: #0a0a18; color: var(--purple); font-weight: 700; p
 .action-area { display: flex; flex-direction: column; gap: 10px }
 
 .prog-card { padding: 22px; margin-bottom: 12px; }
-.prog-title { font-size: 12px; font-weight: 800; color: var(--purple-l); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 10px; text-shadow: 0 0 8px rgba(var(--purple-rgb), 0.3); }
+.prog-title { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 800; color: var(--purple-l); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 10px; text-shadow: 0 0 8px rgba(var(--purple-rgb), 0.3); }
 .prog-msg   { font-size: 14px; color: var(--text-2); margin-bottom: 12px; min-height: 22px }
 .prog-track { background: rgba(0,0,0,0.4); border-radius: 100px; height: 8px; overflow: hidden; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.05); }
 .prog-fill  { height: 100%; border-radius: 100px; background: linear-gradient(90deg, var(--pink), var(--purple), var(--blue)); transition: width .4s ease; width: 0%; box-shadow: 0 0 12px rgba(var(--purple-rgb), .8); position: relative; }
@@ -2977,12 +3073,13 @@ select optgroup { background: #0a0a18; color: var(--purple); font-weight: 700; p
 .dlmode-btn.active { background: var(--purple); color: #fff; box-shadow: 0 2px 8px rgba(var(--purple-rgb), .4); }
 
 @media (max-width: 480px) {
-  .row2        { grid-template-columns: 1fr }
-  .crf-presets { grid-template-columns: repeat(2,1fr) }
-  .vinfo-grid  { grid-template-columns: repeat(2,1fr) }
-  .res-grid    { grid-template-columns: repeat(2,1fr) }
-  .header h1   { font-size: 26px }
-  .tab         { font-size: 12px; padding: 10px 6px }
+  .row2          { grid-template-columns: 1fr }
+  .crf-presets   { grid-template-columns: repeat(2,1fr) }
+  .vinfo-grid    { grid-template-columns: repeat(2,1fr) }
+  .res-grid      { grid-template-columns: repeat(2,1fr) }
+  .preset-grid-3 { grid-template-columns: repeat(2,1fr) }
+  .header h1     { font-size: 26px }
+  .tab           { font-size: 12px; padding: 10px 6px }
 }
 .vn-btn.disabled-btn { opacity: 0.4; cursor: not-allowed; filter: grayscale(1); pointer-events: none; }
 @media (max-width: 600px) {
@@ -3499,7 +3596,6 @@ async function startDownload() {
   const url = $("dl-url").value.trim();
   if (!url || !url.startsWith("http")) return showErr("download", "⚠️ Invalid URL!");
   setBusy("download", true); hideErr("download");
-  const pd = $("paused-download"); if (pd) pd.classList.add("hidden");
   $("prog-download").classList.remove("hidden");
   $("res-download").classList.add("hidden");
   $("btn-area-download").classList.add("hidden");
@@ -3533,11 +3629,13 @@ async function startDownload() {
     $("btn-area-download").classList.remove("hidden"); return;
   }
   S.download.jobId = data.job_id;
+  if (S.download.timer) clearInterval(S.download.timer);
   S.download.timer = setInterval(() => pollJob("download"), 800);
   const cancelBtn = $("btn-cancel-download");
   if (cancelBtn) {
-    cancelBtn.style.display = "inline-block";
+    cancelBtn.style.display = "inline-flex";
     cancelBtn.onclick = async () => {
+      if (!(await customConfirm("Are you sure you want to cancel this download?"))) return;
       cancelBtn.style.display = "none";
       try { await fetch("/api/cancel/" + S.download.jobId, { method: "POST" }); } catch(e) {}
     };
@@ -3695,7 +3793,9 @@ function getPlatformBadge(extractorKey, isPlaylist) {
 async function fetchTitle() {
   const url = $("dl-url").value.trim(); if (!url) return;
   const el = $("dl-title");
+  const btnStart = $("btn-download-start");
   el.style.display = "block"; el.innerHTML = `<span style="color:var(--text-2);">Fetching info...</span>`;
+  if (btnStart) btnStart.disabled = true;
   try {
     const r = await fetch("/api/ytdlp_info", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -3754,6 +3854,8 @@ async function fetchTitle() {
     }
   } catch {
     el.textContent = "Failed to connect to server";
+  } finally {
+    if (btnStart) btnStart.disabled = false;
   }
 }
 let _dlTitleTimer = null;
@@ -3808,6 +3910,7 @@ async function _submit(tab, endpoint, fd) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Error");
     S[tab].jobId = data.job_id;
+    if (S[tab].timer) clearInterval(S[tab].timer);
     S[tab].timer = setInterval(() => pollJob(tab), 800);
   } catch(e) {
     showErr(tab, e.message);
@@ -3839,7 +3942,7 @@ async function pollJob(tab) {
       const eta = Math.round(ela / pct * (100 - pct));
       const etaEl = $("eta-" + tab);
       if (etaEl) {
-        let metaText = eta > 0 ? "~" + eta + "s left" : "";
+        let metaText = (eta > 0 && isFinite(eta)) ? "~" + eta + "s left" : "";
         if (tab === "download" && data.dl_speed)
           metaText = (metaText ? metaText + " · " : "") + data.dl_speed;
         etaEl.textContent = metaText;
@@ -3870,9 +3973,10 @@ async function pollJob(tab) {
         sv("res-s-audio",  data.out_audio   || "—");
         sv("res-s-enc",    data.out_enc     || "—");
       } else if (tab === "audio") {
-        sv("res-a-fmt",  data.out_audio  || "—");
-        sv("res-a-size", data.sz_after   || "—");
-        sv("res-a-time", data.encode_time || "—");
+        sv("res-a-fmt",  data.out_audio    || "—");
+        sv("res-a-size", data.sz_after     || "—");
+        sv("res-a-dur",  data.out_duration || "—");
+        sv("res-a-time", data.encode_time  || "—");
       } else {
         sv("res-d-title", data.dl_title || "—");
         sv("res-d-size",  data.sz_after  || "—");
@@ -3990,7 +4094,6 @@ function resetJob(tab) {
      "res-s-time","res-s-res","res-s-fps","res-s-audio","res-s-enc"]
       .forEach(id => sv(id, "—"));
   } else if (tab === "download") {
-    const pd = $("paused-download"); if (pd) pd.classList.add("hidden");
     ["res-d-title","res-d-size","res-d-time","res-d-dur","res-d-res","res-d-fps","res-d-audio","res-d-enc"]
       .forEach(id => sv(id, "—"));
     const countItem = $("res-d-count-item");
@@ -4294,7 +4397,7 @@ document.addEventListener("visibilitychange", () => {
     _pingTimer = null;
   } else {
     sendPing();                              // update ngay khi quay lại tab
-    _pingTimer = setInterval(sendPing, 1000);
+    if (!_pingTimer) _pingTimer = setInterval(sendPing, 1000);
   }
 });
 
@@ -4345,6 +4448,8 @@ document.addEventListener("DOMContentLoaded", () => {
   detectConnectionMode();
   const dirInput = $("dl-output-dir");
   if (dirInput && $("folder-name-display")) updateFolderDisplay(dirInput.value);
+  // Clear stale timers from previous page load before restoring
+  Object.values(S).forEach(s => { if (s && s.timer) { clearInterval(s.timer); s.timer = null; } });
   restoreActiveBatch();
 });
 
@@ -4387,7 +4492,11 @@ async function restoreActiveBatch() {
       const btnChange = $("btn-change-compress"); if (btnChange) btnChange.style.display = "none";
       $("btn-area-compress").classList.add("hidden");
 
-      $("prog-compress").classList.remove("hidden");
+      const progCard = $("prog-compress");
+      progCard.classList.remove("hidden");
+      progCard.style.background = `linear-gradient(180deg, rgba(var(--purple-rgb), 0.18) 0%, rgba(var(--purple-rgb), 0.00) 100%)`;
+      progCard.style.border = `1px solid rgba(var(--purple-rgb), 0.35)`;
+      progCard.style.boxShadow = `0 16px 40px rgba(0, 0, 0, 0.45)`;
       $("res-compress").classList.add("hidden");
 
       setBusy("compress", true);
@@ -4538,7 +4647,9 @@ async function onFileChange(input, tab) {
   renderBatchList();
 
   setBusy('compress', true);
-  for (let i = 0; i < S.compress.files.length; i++) {
+  const fileCount = S.compress.files.length;
+  for (let i = 0; i < fileCount; i++) {
+    if (i >= S.compress.files.length) break;
     await probeBatchFile(i);
   }
   setBusy('compress', false);
@@ -4597,6 +4708,13 @@ function renderBatchList() {
   }).join('');
 }
 
+function _updateBatchStartBtn() {
+  const btn = $("btn-start-compress");
+  if (!btn) return;
+  const hasReady = S.compress.files && S.compress.files.some(f => f.status === 'ready');
+  btn.disabled = !hasReady;
+}
+
 async function probeBatchFile(index) {
   const fObj = S.compress.files[index];
   fObj.status = 'probing';
@@ -4645,6 +4763,7 @@ async function probeBatchFile(index) {
       }
       loadEl.classList.add("hidden");
       renderBatchList();
+      _updateBatchStartBtn();
       resolve();
     };
     xhr.onerror = () => {
@@ -4652,6 +4771,7 @@ async function probeBatchFile(index) {
       fObj.errMsg = "Network disconnected";
       loadEl.classList.add("hidden");
       renderBatchList();
+      _updateBatchStartBtn();
       resolve();
     };
     xhr.send(fd);
@@ -4683,7 +4803,11 @@ async function startCompress() {
   const timerEl = $("batch-elapsed-timer");
   if (timerEl) timerEl.textContent = "00:00";
 
-  $("prog-compress").classList.remove("hidden");
+  const progCard = $("prog-compress");
+  progCard.classList.remove("hidden");
+  progCard.style.background = `linear-gradient(180deg, rgba(var(--purple-rgb), 0.18) 0%, rgba(var(--purple-rgb), 0.00) 100%)`;
+  progCard.style.border = `1px solid rgba(var(--purple-rgb), 0.35)`;
+  progCard.style.boxShadow = `0 16px 40px rgba(0, 0, 0, 0.45)`;
   $("res-compress").classList.add("hidden");
   $("btn-area-compress").classList.add("hidden");
 
@@ -4901,12 +5025,16 @@ async function pollBatchProgress() {
     _timerEl.textContent = `${String(_m).padStart(2,'0')}:${String(_s).padStart(2,'0')}`;
   }
 
+  const _abortCtrl = new AbortController();
+  const _abortTid  = setTimeout(() => _abortCtrl.abort(), 3000);
   try {
     const res = await fetch("/api/status_batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_ids: activeJobIds })
+      body: JSON.stringify({ job_ids: activeJobIds }),
+      signal: _abortCtrl.signal
     });
+    clearTimeout(_abortTid);
     if (!res.ok) return;
     const batchData = await res.json();
 
@@ -4954,7 +5082,8 @@ async function pollBatchProgress() {
       }
     });
   } catch (e) {
-    console.error("Batch polling error:", e);
+    clearTimeout(_abortTid);
+    if (e.name !== 'AbortError') console.error("Batch polling error:", e);
   }
   } finally {
     _batchPollBusy = false;
@@ -4985,14 +5114,14 @@ function renderBatchResult() {
 
   const badge = $("res-compress").querySelector(".res-badge");
   badge.innerHTML = titleHtml;
+  badge.style.fontSize = '20px';
   badge.style.color = `var(--${themeL})`;
-  badge.style.textShadow = `0 0 10px rgba(var(--${theme}-rgb), 0.4)`;
+  badge.style.textShadow = `0 0 12px rgba(var(--${theme}-rgb), 0.4)`;
 
   const resBox = $("res-compress").querySelector(".result-box");
-  resBox.style.background = `linear-gradient(180deg, rgba(var(--${theme}-rgb), 0.08) 0%, rgba(var(--${theme}-rgb), 0.01) 100%)`;
-  resBox.style.border = `1px solid rgba(var(--${theme}-rgb), 0.15)`;
-  resBox.style.borderTop = `1px solid rgba(var(--${theme}-rgb), 0.4)`;
-  resBox.style.boxShadow = `0 8px 32px 0 rgba(0, 0, 0, 0.3), 0 4px 24px 0 rgba(var(--${theme}-rgb), 0.1)`;
+  resBox.style.background = `linear-gradient(180deg, rgba(var(--${theme}-rgb), 0.18) 0%, rgba(var(--${theme}-rgb), 0.00) 100%)`;
+  resBox.style.border = `1px solid rgba(var(--${theme}-rgb), 0.35)`;
+  resBox.style.boxShadow = `0 16px 40px rgba(0, 0, 0, 0.45)`;
 
   // Tính tổng thời gian từ lúc bấm Bắt đầu nén đến lúc xong tất cả
   let totalTimeHtml = '';
@@ -5046,4 +5175,718 @@ function copyLog(btn) {
   svg.outerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--green)"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
   setTimeout(() => { btn.querySelector("svg").outerHTML = savedSvg; span.textContent = "Copy"; }, 2000);
 }
+
+===== FILE: templates/index.html =====
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>VideoShrink Web</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header" style="position: relative;">
+    <h1><img src="{{ url_for('static', filename='favicon.svg') }}" style="vertical-align: middle; margin-right: 10px; width: 36px; height: 36px; margin-top: -6px;"><span class="title-grad">VideoShrink</span></h1>
+    <p>Advanced Media Compressor & Downloader</p>
+  </div>
+
+  <div class="conn-box mb12">
+    <div class="conn-header" onclick="toggleConn()">
+      <div class="conn-header-left" style="font-size: 12px; font-weight: 600;">
+        <i data-lucide="globe" style="width:14px;height:14px;transform:translateY(-1px)"></i><span id="conn-title" style="text-transform: uppercase; letter-spacing: 1px;">SYSTEM DASHBOARD</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <div id="client-count-container" style="background: rgba(255,255,255,0.05); padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; color: var(--text-2); display:flex; align-items:center; gap:6px;">
+          <i data-lucide="monitor" style="width:14px;height:14px;vertical-align:middle"></i> <span id="dash-client-count">0 Clients</span>
+        </div>
+        <div id="server-status-item" style="background: rgba(255,255,255,0.05); padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; color: var(--text-3); display:flex; align-items:center; gap:6px;">
+          <span id="server-status-dot" class="status-dot" style="background: var(--yellow); box-shadow: 0 0 8px var(--yellow);"></span><span id="server-status-txt" style="color: var(--yellow); text-shadow: 0 0 8px var(--yellow);">CONNECTING</span>
+        </div>
+        <span class="conn-arrow open" id="conn-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+      </div>
+    </div>
+    <div class="conn-body" id="conn-body" style="display:none">
+      <!-- Server mode: truy cập từ localhost -->
+      <div id="conn-server-mode">
+        <div class="conn-row">
+          <span class="conn-icon"><i data-lucide="laptop" style="width:18px;height:18px"></i></span>
+          <span class="conn-label">This PC (Local)</span>
+          <a class="conn-link" href="http://localhost:5000" target="_blank">localhost:5000</a>
+          <button class="conn-copy-btn" onclick="copyUrl('http://localhost:5000',this)">Copy</button>
+        </div>
+        <div class="conn-row">
+          <span class="conn-icon"><i data-lucide="smartphone" style="width:18px;height:18px"></i></span>
+          <span class="conn-label">Other devices</span>
+          <a class="conn-link" href="http://{{ local_ip }}:5000" target="_blank">{{ local_ip }}:5000</a>
+          <button class="conn-copy-btn" onclick="copyUrl('http://{{ local_ip }}:5000',this)">Copy</button>
+        </div>
+        <div class="conn-tip" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 8px 12px; border-radius: var(--radius-sm); margin-top: 8px; margin-bottom: 16px;"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Access from other devices via the same WiFi/LAN</div>
+
+        <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px; margin-top: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 8px; margin-bottom: 8px;">
+            <div style="font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 6px;"><i data-lucide="monitor" style="width:14px;height:14px;transform:translateY(-1px)"></i> ACTIVE CLIENTS</div>
+            <div style="font-size: 12px; font-weight: 500; color: var(--text-2);" id="dash-client-count-2">0 Clients</div>
+          </div>
+          <div id="dash-client-list" style="display: flex; flex-direction: column; gap: 8px;">
+            <div style="color:var(--text-3); text-align:center; padding:10px 0; font-size: 10px;">No external clients connected</div>
+          </div>
+        </div>
+      </div>
+      <!-- Client mode: truy cập từ điện thoại / PC khác qua IP -->
+      <div id="conn-client-mode" class="hidden">
+        <div class="conn-row">
+          <span class="conn-icon"><i data-lucide="radio" style="width:18px;height:18px"></i></span>
+          <span class="conn-label">Server</span>
+          <a class="conn-link" id="conn-client-link" href="#" target="_blank">—</a>
+          <button class="conn-copy-btn" onclick="copyUrl($('conn-client-link').href,this)">Copy</button>
+        </div>
+        <div class="conn-tip"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Connected via Local Area Network (LAN)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('compress',this)"><i data-lucide="minimize" class="tab-icon"></i> Compress</button>
+    <button class="tab"        onclick="switchTab('social',this)"><i data-lucide="smartphone" class="tab-icon"></i> Social</button>
+    <button class="tab"        onclick="switchTab('audio',this)"><i data-lucide="music" class="tab-icon"></i> Audio</button>
+    <button class="tab"        onclick="switchTab('download',this)"><i data-lucide="download-cloud" class="tab-icon"></i> Download</button>
+  </div>
+
+  <!-- ════════════════ NÉN VIDEO ════════════════ -->
+  <div class="panel active" id="tab-compress">
+
+    <div class="card">
+      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Video files</div>
+      <div class="drop" id="drop-compress">
+        <input type="file" multiple
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'compress')">
+        <span class="drop-icon"><i data-lucide="upload-cloud" style="width:48px;height:48px;stroke-width:1.5"></i></span>
+        <div class="drop-txt">Click or drag & drop video here</div>
+        <div class="drop-sub">MP4 · MOV · MKV · AVI · WebM</div>
+      </div>
+      <div class="vinfo" id="vinfo-compress">
+        <input type="file" id="repick-compress" style="display:none" multiple
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'compress')">
+        <div class="vinfo-name">
+          <span class="vn-icon"><i data-lucide="film" style="width:16px;height:16px"></i></span>
+          <span class="vn-text" id="vn-name-compress">Selected video</span>
+          <button id="btn-change-compress" class="vn-btn" onclick="document.getElementById('repick-compress').click()">Change</button>
+        </div>
+        <div class="vinfo-loading hidden" id="vinfo-loading-compress"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
+        <div id="batch-list-compress" class="dark-scroll" style="margin-top: 10px; max-height: 250px; overflow-y: auto; padding-right: 5px;">
+          <!-- Danh sách file sẽ render vào đây -->
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="card-settings-compress">
+      <div class="card-title"><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i> Encoding Settings</div>
+      <div class="row2 mb12">
+        <div>
+          <label>Encoder</label>
+          <div class="cs-wrap" id="cs-encoder">
+            <div class="cs-trigger" onclick="toggleCS('cs-encoder')">
+              <span class="cs-val" id="cs-encoder-val">Loading...</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              {% for group in encoder_groups %}
+              <div class="cs-group {{ 'warn' if group.warning else '' }}">{{ group.group|safe }}</div>
+              {% for enc in group.encoders %}
+              <div class="cs-option {{ 'selected' if default_enc == enc.codec else '' }}"
+                   data-value="{{ enc.codec }}"
+                   onclick="pickEncoder('{{ enc.codec }}', this.innerHTML)">
+                {{ enc.label|safe }}
+              </div>
+              {% endfor %}
+              {% endfor %}
+            </div>
+          </div>
+          <input type="hidden" id="enc-compress" value="{{ default_enc }}">
+        </div>
+        <div>
+          <label>Format output</label>
+          <div class="cs-wrap" id="cs-format">
+            <div class="cs-trigger" onclick="toggleCS('cs-format')">
+              <span class="cs-val" id="cs-format-val"><i data-lucide="lock" style="width:14px;height:14px;vertical-align:-2px"></i> Keep original</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              <div class="cs-option selected" data-value="original" onclick="pickFormat('original', this.innerHTML)"><i data-lucide="lock" style="width:14px;height:14px;vertical-align:-2px"></i> Keep original</div>
+              <div class="cs-option" data-value=".mp4" onclick="pickFormat('.mp4', this.innerHTML)">MP4 — Best compatibility</div>
+              <div class="cs-option" data-value=".mov" onclick="pickFormat('.mov', this.innerHTML)">MOV — Apple standard</div>
+              <div class="cs-option" data-value=".mkv" onclick="pickFormat('.mkv', this.innerHTML)">MKV — Flexible</div>
+            </div>
+          </div>
+          <input type="hidden" id="fmt-compress" value="original">
+        </div>
+      </div>
+
+      <!-- Advanced toggle -->
+      <div class="adv-toggle" id="adv-toggle-compress"
+           onclick="toggleAdv('adv-compress','adv-arrow-compress','adv-toggle-compress')">
+        <div class="adv-toggle-left"><span><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i></span><span>Advanced Settings</span></div>
+        <span class="adv-arrow" id="adv-arrow-compress"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+      </div>
+      <div class="adv-body" id="adv-compress">
+
+        <!-- CRF -->
+        <label style="margin-bottom:8px">Compression Quality (CRF)</label>
+        <div class="crf-presets">
+          <button class="crf-btn active" data-preset="high" onclick="setCRFPreset('high')">
+            <span class="crf-emoji"><i data-lucide="trophy"></i></span>
+            <span class="crf-name">Highest</span>
+            <span class="crf-val" id="crf-lbl-high">CRF 24</span>
+          </button>
+          <button class="crf-btn" data-preset="mid" onclick="setCRFPreset('mid')">
+            <span class="crf-emoji"><i data-lucide="scale"></i></span>
+            <span class="crf-name">Balanced</span>
+            <span class="crf-val" id="crf-lbl-mid">CRF 28</span>
+          </button>
+          <button class="crf-btn" data-preset="low" onclick="setCRFPreset('low')">
+            <span class="crf-emoji"><i data-lucide="save"></i></span>
+            <span class="crf-name">Smallest</span>
+            <span class="crf-val" id="crf-lbl-low">CRF 32</span>
+          </button>
+          <button class="crf-btn" data-preset="custom" onclick="setCRFPreset('custom')">
+            <span class="crf-emoji"><i data-lucide="sliders"></i></span>
+            <span class="crf-name">Custom</span>
+            <span class="crf-val">Custom</span>
+          </button>
+        </div>
+        <div class="crf-custom-row" id="crf-custom-row">
+          <span class="crf-range-lbl">0</span>
+          <input type="range" id="crf-slider" min="0" max="51" value="24"
+                 oninput="onCRFSlider(this.value)">
+          <span class="crf-custom-val" id="crf-display">24</span>
+          <span class="crf-range-lbl" id="crf-max-lbl">51</span>
+        </div>
+        <div class="crf-hint" id="crf-hint">lower = better quality · higher = smaller file</div>
+
+        <!-- Mute audio -->
+        <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.06)">
+          <label style="margin-bottom:8px"><i data-lucide="volume-2" style="width:18px;height:18px;vertical-align:-2px"></i> Audio</label>
+          <div class="preset-grid">
+            <div class="preset-btn active" id="mute-btn-keep" onclick="setMute(false)">
+              <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+              <span class="pi"><i data-lucide="volume-2"></i></span>
+              <div class="pn">Keep audio</div>
+            </div>
+            <div class="preset-btn" id="mute-btn-mute" onclick="setMute(true)">
+              <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+              <span class="pi"><i data-lucide="volume-x"></i></span>
+              <div class="pn">Mute audio</div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /adv-body -->
+    </div>
+
+    <input type="hidden" id="crf-value" value="24">
+    <div class="err" id="err-compress"></div>
+
+    <div class="prog-card hidden" id="prog-compress">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Total Progress: <span id="batch-progress-count" style="font-size:13px; font-weight:normal;"></span>
+        </div>
+        <span id="batch-elapsed-timer" style="font-size:13px; font-weight:700; color:var(--purple-l); font-variant-numeric:tabular-nums; letter-spacing:0.5px;"></span>
+      </div>
+      <div id="batch-progress-list" class="dark-scroll" style="max-height: 350px; overflow-y: auto; padding-right: 5px;"></div>
+    </div>
+
+    <div id="res-compress" class="hidden">
+      <div class="result-box">
+        <div class="res-badge" style="margin-bottom:15px"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> All tasks completed!</div>
+        <div id="batch-result-list" class="dark-scroll" style="max-height: 350px; overflow-y: auto; padding-right: 5px;"></div>
+      </div>
+      <div class="action-area" style="margin-top: 15px;">
+        <button class="btn btn-primary" onclick="location.reload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> Start new batch</button>
+      </div>
+    </div>
+
+    <div id="btn-area-compress" class="mt8">
+      <button class="btn btn-primary" id="btn-compress"
+              onclick="startCompress()" {{ 'disabled' if not tools.ffmpeg }}>
+        <i data-lucide="rocket" style="width:18px;height:18px;vertical-align:-2px"></i> Start compression
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════ SOCIAL ════════════════ -->
+  <div class="panel" id="tab-social">
+    <div class="card">
+      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Media file</div>
+      <div class="drop" id="drop-social">
+        <input type="file"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,image/jpeg,image/png,image/heic,image/heif,image/webp,.mp4,.mov,.mkv,.avi,.webm,.m4v,.jpg,.jpeg,.heic,.heif,.png,.webp"
+          onchange="onFileChange(this,'social')">
+        <span class="drop-icon"><i data-lucide="upload-cloud" style="width:48px;height:48px;stroke-width:1.5"></i></span>
+        <div class="drop-txt">Video or image</div>
+        <div class="drop-sub">Video & HEIC/JPG/PNG supported</div>
+      </div>
+      <div class="vinfo" id="vinfo-social">
+        <input type="file" id="repick-social" style="display:none"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,image/jpeg,image/png,image/heic,image/heif,image/webp,.mp4,.mov,.mkv,.avi,.webm,.m4v,.jpg,.jpeg,.heic,.heif,.png,.webp"
+          onchange="onFileChange(this,'social')">
+        <div class="vinfo-name">
+          <span class="vn-icon"><i data-lucide="paperclip" style="width:16px;height:16px"></i></span>
+          <span class="vn-text" id="vn-name-social"></span>
+          <button class="vn-btn" onclick="document.getElementById('repick-social').click()">Change file</button>
+        </div>
+        <div class="vinfo-loading hidden" id="vinfo-loading-social"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
+        <div class="vinfo-grid">
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="hard-drive"></i>Size</div><div class="vinfo-val" id="vi-size-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="file-video"></i>Type</div><div class="vinfo-val" id="vi-type-s">—</div></div>
+        </div>
+        <div class="vinfo-grid hidden" id="vinfo-video-s">
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="cpu"></i>Codec</div><div class="vinfo-val" id="vi-codec-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="scan"></i>Resolution</div><div class="vinfo-val" id="vi-res-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="activity"></i>FPS</div><div class="vinfo-val" id="vi-fps-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="clock"></i>Duration</div><div class="vinfo-val" id="vi-dur-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="music"></i>Audio</div><div class="vinfo-val" id="vi-audio-s">—</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="card-video-preset">
+      <div class="card-title"><i data-lucide="clapperboard" style="width:18px;height:18px;vertical-align:-2px"></i> Platform Preset</div>
+      <div class="preset-grid">
+        {% for key, p in social_presets.items() %}
+        <div class="preset-btn {% if loop.first %}active{% endif %}"
+             data-key="{{ key }}" onclick="selectSocialPreset('{{ key }}')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+          <span class="pi"><i data-lucide="{{ p.icon }}" style="width:24px;height:24px"></i></span>
+          <div class="pn">{{ p.label }}</div>
+          {% if p.sub %}<div class="ps">{{ p.sub }}</div>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="card hidden" id="card-photo-preset">
+      <div class="card-title"><i data-lucide="image" style="width:18px;height:18px;vertical-align:-2px"></i> Image Preset</div>
+      <div class="preset-grid">
+        {% for key, p in photo_presets.items() %}
+        <div class="preset-btn {% if loop.first %}active{% endif %}"
+             data-key="{{ key }}" onclick="selectPhotoPreset('{{ key }}')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+          <span class="pi"><i data-lucide="{{ p.icon }}" style="width:24px;height:24px"></i></span>
+          <div class="pn">{{ p.label }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="err" id="err-social"></div>
+    <div class="prog-card hidden" id="prog-social">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Exporting...
+        </div>
+      </div>
+      <div class="prog-msg" id="msg-social"></div>
+      <div class="prog-track"><div class="prog-fill" id="bar-social"></div></div>
+      <div class="prog-meta"><span id="pct-social">0%</span><span id="eta-social"></span></div>
+    </div>
+    <div id="res-social" class="hidden">
+      <div class="result-box">
+        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Export successful!</div>
+        <div class="res-filename">
+          <span class="rf-icon"><i data-lucide="smartphone"></i></span>
+          <span class="rf-text" id="res-s-fname">—</span>
+        </div>
+        <div class="res-grid">
+          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Before</div><div class="res-val" id="res-s-before">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="file-check"></i>After</div><div class="res-val" id="res-s-after">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="trending-down"></i>Reduced</div><div class="res-val" id="res-s-pct">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Elapsed</div><div class="res-val" id="res-s-time">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="scan"></i>Resolution</div><div class="res-val" id="res-s-res">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="activity"></i>FPS</div><div class="res-val" id="res-s-fps">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="music"></i>Audio</div><div class="res-val" id="res-s-audio">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="layers"></i>Preset</div><div class="res-val" id="res-s-enc">—</div></div>
+        </div>
+        <div class="warn-box hidden" id="warn-social"></div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-success" onclick="doDownload('social')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download</button>
+        <button class="btn btn-outline" onclick="resetJob('social')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New file</button>
+      </div>
+    </div>
+    <div id="btn-area-social" class="mt8">
+      <button class="btn btn-primary" id="btn-social"
+              onclick="startSocial()" {{ 'disabled' if not tools.ffmpeg }}>
+        <i data-lucide="smartphone" style="width:18px;height:18px;vertical-align:-2px"></i> Export for Social
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════ AUDIO ════════════════ -->
+  <div class="panel" id="tab-audio">
+    <div class="card">
+      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Video file</div>
+      <div class="drop" id="drop-audio">
+        <input type="file"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'audio')">
+        <span class="drop-icon"><i data-lucide="music" style="width:48px;height:48px;stroke-width:1.5"></i></span>
+        <div class="drop-txt">Click to select video</div>
+        <div class="drop-sub">Will extract audio to a separate file</div>
+      </div>
+      <div class="vinfo" id="vinfo-audio">
+        <input type="file" id="repick-audio" style="display:none"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'audio')">
+        <div class="vinfo-name">
+          <span class="vn-icon"><i data-lucide="music" style="width:16px;height:16px"></i></span>
+          <span class="vn-text" id="vn-name-audio"></span>
+          <button class="vn-btn" onclick="document.getElementById('repick-audio').click()">Change file</button>
+        </div>
+        <div class="vinfo-loading hidden" id="vinfo-loading-audio"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
+        <div class="vinfo-grid">
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="hard-drive"></i>Size</div><div class="vinfo-val" id="vi-size-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="cpu"></i>Original codec</div><div class="vinfo-val" id="vi-codec-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="scan"></i>Resolution</div><div class="vinfo-val" id="vi-res-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="activity"></i>FPS</div><div class="vinfo-val" id="vi-fps-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="clock"></i>Duration</div><div class="vinfo-val" id="vi-dur-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="music"></i>Audio</div><div class="vinfo-val" id="vi-audio-a">—</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><i data-lucide="music" style="width:18px;height:18px;vertical-align:-2px"></i> Audio format</div>
+      <div class="preset-grid">
+        {% for key, af in audio_formats.items() %}
+        <div class="preset-btn {% if key=='mp3' %}active{% endif %}"
+             data-key="{{ key }}" onclick="selectAudioFmt('{{ key }}')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="{{ af.icon }}" style="width:24px;height:24px"></i></span>
+          <div class="pn">{{ af.label }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="err" id="err-audio"></div>
+    <div class="prog-card hidden" id="prog-audio">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Extracting audio...
+        </div>
+      </div>
+      <div class="prog-msg" id="msg-audio"></div>
+      <div class="prog-track"><div class="prog-fill" id="bar-audio"></div></div>
+      <div class="prog-meta"><span id="pct-audio">0%</span><span id="eta-audio"></span></div>
+    </div>
+    <div id="res-audio" class="hidden">
+      <div class="result-box">
+        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Audio extracted successfully!</div>
+        <div class="res-grid">
+          <div class="res-item"><div class="res-label"><i data-lucide="music"></i>Format</div><div class="res-val" id="res-a-fmt">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Size</div><div class="res-val" id="res-a-size">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="timer"></i>Duration</div><div class="res-val" id="res-a-dur">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Elapsed</div><div class="res-val" id="res-a-time">—</div></div>
+        </div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-success" onclick="doDownload('audio')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download</button>
+        <button class="btn btn-outline" onclick="resetJob('audio')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New file</button>
+      </div>
+    </div>
+    <div id="btn-area-audio" class="mt8">
+      <button class="btn btn-primary" id="btn-audio"
+              onclick="startAudio()" {{ 'disabled' if not tools.ffmpeg }}>
+        <i data-lucide="music" style="width:18px;height:18px;vertical-align:-2px"></i> Extract audio
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════ DOWNLOAD ════════════════ -->
+  <div class="panel" id="tab-download">
+    {% if not tools.ytdlp %}
+    <div class="err" style="display:block"><i data-lucide="x-circle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> yt-dlp not installed! Place yt-dlp.exe in the app.py folder</div>
+    {% endif %}
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div class="card-title" style="margin-bottom:0"><i data-lucide="link" style="width:18px;height:18px;vertical-align:-2px"></i> Video / audio / playlist URL</div>
+        <div style="display:flex;gap:4px;background:rgba(0,0,0,.25);border:1px solid var(--card-border);border-radius:100px;padding:3px">
+          <button id="dlmode-single" class="dlmode-btn active" onclick="setDlMode('single',this)"><i data-lucide="link" style="width:13px;height:13px;vertical-align:-2px"></i> Single</button>
+          <button id="dlmode-batch"  class="dlmode-btn"        onclick="setDlMode('batch',this)"><i data-lucide="list" style="width:13px;height:13px;vertical-align:-2px"></i> Batch</button>
+        </div>
+      </div>
+      <div id="dl-single-row" class="url-row">
+        <input type="url" id="dl-url" class="dark-input" placeholder="https://youtube.com/watch?v=..." oninput="onUrlChange()">
+      </div>
+      <div id="dl-batch-row" style="display:none">
+        <textarea id="dl-urls" class="dark-input" rows="5"
+          placeholder="One URL per line:&#10;https://youtube.com/watch?v=...&#10;https://tiktok.com/@user/video/..."
+          style="width:100%;box-sizing:border-box;resize:vertical;font-size:13px;line-height:1.6;font-family:inherit"></textarea>
+        <div style="font-size:11px;color:var(--text-3);margin-top:4px"><i data-lucide="info" style="width:12px;height:12px;vertical-align:-1px;color:var(--blue)"></i> Each URL on a separate line. Playlist and quality settings apply to all.</div>
+      </div>
+      <div class="dl-title-preview" id="dl-title"></div>
+
+      {% if is_server %}
+      <div class="card-title" style="margin-top:16px"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Save folder</div>
+      <div id="folder-display"
+           style="display:flex;align-items:center;gap:12px;background:rgba(var(--purple-rgb), 0.04);border:1px solid rgba(var(--purple-rgb), 0.2);border-radius:var(--radius-sm);padding:11px 14px;cursor:pointer;transition:all 0.2s;user-select:none;margin-bottom:6px"
+           onmouseover="this.style.background='rgba(var(--purple-rgb), 0.09)';this.style.borderColor='rgba(var(--purple-rgb), 0.45)'"
+           onmouseout="this.style.background='rgba(var(--purple-rgb), 0.04)';this.style.borderColor='rgba(var(--purple-rgb), 0.2)'"
+           onclick="browseFolder()">
+        <i data-lucide="folder-open" style="width:22px;height:22px;color:var(--purple-l);flex-shrink:0"></i>
+        <div style="flex:1;overflow:hidden;min-width:0">
+          <div id="folder-name-display" style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+          <div id="folder-path-display" style="font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px"></div>
+        </div>
+        <button id="btn-browse-folder"
+                onclick="event.stopPropagation();browseFolder()"
+                style="flex-shrink:0;background:rgba(var(--purple-rgb), 0.1);border:1px solid rgba(var(--purple-rgb), 0.3);color:var(--purple-l);border-radius:var(--radius-sm);padding:5px 11px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit;display:flex;align-items:center;gap:5px;white-space:nowrap">
+          <i data-lucide="pencil" style="width:12px;height:12px"></i>
+          <span id="btn-browse-text">Change</span>
+        </button>
+      </div>
+      <input type="hidden" id="dl-output-dir" value="{{ default_out_dir }}">
+      {% else %}
+      <input type="hidden" id="dl-output-dir" value="{{ default_out_dir }}">
+      {% endif %}
+    </div>
+    <div class="card" id="card-dl-settings">
+      <div class="card-title"><i data-lucide="download-cloud" style="width:18px;height:18px;vertical-align:-2px"></i> Download type</div>
+      <div class="preset-grid mb12" style="margin-bottom:12px">
+        <div class="preset-btn active" id="dl-type-video" onclick="setDlType('video')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="clapperboard"></i></span><div class="pn">Video</div>
+        </div>
+        <div class="preset-btn" id="dl-type-audio" onclick="setDlType('audio')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="music"></i></span><div class="pn">Audio only</div>
+        </div>
+      </div>
+      <div id="dl-video-opts">
+        <label>Video quality</label>
+        <div>
+          <div class="cs-wrap" id="cs-dl-quality">
+            <div class="cs-trigger" onclick="toggleCS('cs-dl-quality')">
+              <span class="cs-val" id="cs-dl-quality-val"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              <div class="cs-option selected" data-value="best" onclick="pickDlQuality('best', this.innerHTML)"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</div>
+              <div class="cs-option" data-value="1080p" onclick="pickDlQuality('1080p', this.innerHTML)"><i data-lucide="monitor" style="width:14px;height:14px;vertical-align:-2px"></i> 1080p</div>
+              <div class="cs-option" data-value="720p" onclick="pickDlQuality('720p', this.innerHTML)"><i data-lucide="smartphone" style="width:14px;height:14px;vertical-align:-2px"></i> 720p</div>
+              <div class="cs-option" data-value="480p" onclick="pickDlQuality('480p', this.innerHTML)"><i data-lucide="save" style="width:14px;height:14px;vertical-align:-2px"></i> 480p</div>
+            </div>
+          </div>
+          <input type="hidden" id="dl-quality" value="best">
+        </div>
+      </div>
+      <div id="dl-audio-opts" class="hidden">
+        <label>Audio quality</label>
+        <div>
+          <div class="cs-wrap" id="cs-dl-audio">
+            <div class="cs-trigger" onclick="toggleCS('cs-dl-audio')">
+              <span class="cs-val" id="cs-dl-audio-val">{{ download_audio_quality['m4a'].label|safe }}</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              {% for key, aq in download_audio_quality.items() %}
+              <div class="cs-option {{ 'selected' if key == 'm4a' else '' }}" data-value="{{ key }}" onclick="pickDlAudio('{{ key }}', this.innerHTML)">{{ aq.label|safe }}</div>
+              {% endfor %}
+            </div>
+          </div>
+          <input type="hidden" id="dl-audio-fmt" value="m4a">
+        </div>
+      </div>
+      <div class="adv-toggle" id="adv-toggle-download"
+           onclick="toggleAdv('adv-download','adv-arrow-download','adv-toggle-download')">
+        <div class="adv-toggle-left"><span><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i></span><span>Advanced options</span></div>
+        <span class="adv-arrow" id="adv-arrow-download"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+      </div>
+      <div class="adv-body" id="adv-download">
+      <label class="playlist-toggle">
+        <input type="checkbox" id="dl-playlist" checked>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="clipboard-list" style="width:16px;height:16px;vertical-align:-2px"></i> Download entire playlist</div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Download all videos in the playlist</div>
+        </div>
+      </label>
+      <label class="playlist-toggle" style="margin-top:8px">
+        <input type="checkbox" id="dl-subs" onchange="$('dl-subs-lang').style.display=this.checked?'flex':'none'">
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="subtitles" style="width:16px;height:16px;vertical-align:-2px"></i> Download subtitles</div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Embed subtitles into video file</div>
+        </div>
+      </label>
+      <div id="dl-subs-lang" style="display:none;align-items:center;gap:8px;margin-top:6px;padding:8px 10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
+        <span style="font-size:12px;color:var(--text-3);white-space:nowrap"><i data-lucide="languages" style="width:14px;height:14px;vertical-align:-2px"></i> Languages:</span>
+        <input type="text" id="dl-subs-lang-val" class="dark-input" placeholder="vi,en" value="vi,en" style="flex:1;padding:6px 10px;font-size:13px">
+        <span style="font-size:11px;color:var(--text-3);white-space:nowrap">comma-separated</span>
+      </div>
+      <label class="playlist-toggle" style="margin-top:8px">
+        <input type="checkbox" id="dl-trim-enable" onchange="$('dl-trim-inputs').style.display=this.checked?'block':'none';updateDlTrimHint()" disabled>
+        <div id="dl-trim-text" style="opacity:0.4; transition:opacity 0.3s">
+          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="scissors" style="width:16px;height:16px;vertical-align:-2px"></i> Download time range</div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Only available after video duration is loaded</div>
+        </div>
+      </label>
+      <div id="dl-trim-inputs" style="display:none;margin-top:6px;padding:10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="play" style="width:11px;height:11px;vertical-align:-1px"></i> Start</div>
+            <input type="text" id="dl-trim-start" class="dark-input" placeholder="e.g. 1:30 or 90" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="square" style="width:11px;height:11px;vertical-align:-1px"></i> End</div>
+            <input type="text" id="dl-trim-end" class="dark-input" placeholder="e.g. 2:45" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text-3);text-align:center;margin-top:6px;font-style:italic">Format: Seconds (e.g. 90) or MM:SS (e.g. 1:30) or HH:MM:SS</div>
+        <div id="dl-trim-hint" style="margin-top:5px;font-size:11px;color:var(--text-3);text-align:center;min-height:16px"></div>
+      </div>
+      <div class="section-label" style="margin-top:12px"><i data-lucide="cookie" style="width:18px;height:18px;vertical-align:-2px"></i> Cookie</div>
+      <div class="cookie-status" id="cookie-file-status"></div>
+      <div class="preset-grid preset-grid-3" style="gap:6px">
+        <div class="preset-btn active" data-browser="none" onclick="selectBrowser('none')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="ban"></i></span><div class="pn">None</div>
+        </div>
+        <div class="preset-btn" data-browser="cookies_txt" onclick="selectBrowser('cookies_txt')" id="btn-cookies-txt">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="file-text"></i></span>
+          <div class="pn" id="lbl-cookies-txt">cookies.txt</div>
+        </div>
+        <div class="preset-btn" data-browser="chrome" onclick="selectBrowser('chrome')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="globe" style="width:24px;height:24px"></i></span><div class="pn">Chrome</div>
+        </div>
+        <div class="preset-btn" data-browser="edge" onclick="selectBrowser('edge')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="compass" style="width:24px;height:24px"></i></span><div class="pn">Edge</div>
+        </div>
+        <div class="preset-btn" data-browser="firefox" onclick="selectBrowser('firefox')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="flame" style="width:24px;height:24px"></i></span><div class="pn">Firefox</div>
+        </div>
+        <div class="preset-btn" data-browser="brave" onclick="selectBrowser('brave')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="shield" style="width:24px;height:24px"></i></span><div class="pn">Brave</div>
+        </div>
+      </div>
+      <div class="browser-warn" id="browser-warn">
+        <i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> <strong>Completely close</strong> your browser before downloading! Or use cookies.txt.
+      </div>
+      <div class="cookies-guide" id="cookies-txt-guide">
+        <i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Install <strong>"Get cookies.txt LOCALLY"</strong> on Chrome/Edge → Export → Place in app.py folder
+      </div>
+      </div><!-- /adv-body -->
+    </div><!-- /card -->
+    <div class="err" id="err-download"></div>
+    <div class="prog-card hidden" id="prog-download">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Downloading...
+        </div>
+        <button id="btn-cancel-download" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:var(--red);border-radius:var(--radius-sm);padding:4px 10px;cursor:pointer;font-size:11px;font-weight:600;font-family:inherit;transition:all 0.2s;"><i data-lucide="x" style="width:14px;height:14px;vertical-align:-2px"></i> Cancel</button>
+      </div>
+      <div class="prog-msg" id="msg-download"></div>
+      <div class="prog-track"><div class="prog-fill" id="bar-download"></div></div>
+      <div class="prog-meta"><span id="pct-download">0%</span><span id="eta-download"></span></div>
+    </div>
+    <div id="res-download" class="hidden">
+      <div class="result-box">
+        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Download successful!</div>
+        <div class="res-filename">
+          <span class="rf-icon"><i data-lucide="globe"></i></span>
+          <span class="rf-text" id="res-d-title">—</span>
+          <span class="rf-badge hidden" id="res-d-count-item"><span id="res-d-count"></span></span>
+        </div>
+        <div class="res-grid">
+          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Size</div><div class="res-val" id="res-d-size">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Download time</div><div class="res-val" id="res-d-time">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="clock"></i>Duration</div><div class="res-val" id="res-d-dur">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="scan"></i>Resolution</div><div class="res-val" id="res-d-res">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="activity"></i>FPS</div><div class="res-val" id="res-d-fps">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="music"></i>Audio</div><div class="res-val" id="res-d-audio">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="layers"></i>Format</div><div class="res-val" id="res-d-enc">—</div></div>
+          {% if is_server %}
+          <div class="res-item" onclick="openFolder('download')" style="cursor:pointer; transition: all 0.2s; border: 1px dashed rgba(var(--green-rgb), 0.3); background: rgba(var(--green-rgb), 0.05);" onmouseover="this.style.background='rgba(var(--green-rgb), 0.1)'; this.style.borderColor='rgba(var(--green-rgb), 0.6)';" onmouseout="this.style.background='rgba(var(--green-rgb), 0.05)'; this.style.borderColor='rgba(var(--green-rgb), 0.3)';">
+             <div class="res-label" style="color:var(--green); display: flex; align-items: center; justify-content: space-between;">Save folder <i data-lucide="external-link" style="width:12px;height:12px;opacity:0.7;"></i></div>
+             <div class="res-val" style="color:var(--green); font-weight: 700; display: flex; align-items: center; gap: 6px; margin-top:4px;">
+               <i data-lucide="folder-open" style="width:18px;height:18px;"></i> Click to open folder
+             </div>
+          </div>
+          {% endif %}
+        </div>
+        <div class="warn-box hidden" id="warn-download"></div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-success hidden" id="btn-dl-file" onclick="doDownload('download')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download to device</button>
+        <button class="btn btn-outline" onclick="resetJob('download')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New download</button>
+      </div>
+    </div>
+
+    <!-- Batch download result list -->
+    <div id="res-batch-dl" class="hidden">
+      <div class="result-box" style="padding:0;overflow:hidden">
+        <div style="padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.06);font-size:12px;font-weight:600;color:var(--text-2);display:flex;justify-content:space-between;align-items:center">
+          <span><i data-lucide="list" style="width:14px;height:14px;vertical-align:-2px"></i> Batch download</span>
+          <span id="batch-dl-summary" style="color:var(--text-3)"></span>
+        </div>
+        <div id="batch-dl-list" style="max-height:400px;overflow-y:auto"></div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-outline" onclick="resetBatchDownload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New batch</button>
+      </div>
+    </div>
+    <div id="btn-area-download" class="mt8">
+      <button class="btn btn-primary" id="btn-download-start"
+              onclick="startDownload()" {{ 'disabled' if not tools.ytdlp }}>
+        <i data-lucide="download-cloud" style="width:18px;height:18px;vertical-align:-2px"></i> Start download
+      </button>
+    </div>
+  </div>
+
+</div>
+
+<!-- Log Modal -->
+<div id="log-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:var(--bg); border:1px solid var(--card-border); border-radius:var(--radius-sm); width:100%; max-width:800px; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5);">
+    <div style="padding:16px 20px; border-bottom:1px solid var(--card-border); display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="margin:0; font-size:16px; display:flex; align-items:center; gap:8px;">
+          <span style="color:var(--red);"><i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i></span> <span id="log-modal-title">FFmpeg Error Details</span>
+        </h3>
+        <div style="display:flex; align-items:center; gap:16px;">
+          <button onclick="copyLog(this)" style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:var(--text-2); border-radius:var(--radius-sm); padding:6px 12px; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:6px; transition:all 0.2s; font-weight:600; font-family:inherit;" onmouseover="this.style.background='rgba(255,255,255,0.1)'; this.style.color='var(--text)';" onmouseout="this.style.background='rgba(255,255,255,0.05)'; this.style.color='var(--text-2)';">
+            <i data-lucide="copy" style="width:14px;height:14px"></i>
+            <span>Copy</span>
+          </button>
+          <button onclick="document.getElementById('log-modal').style.display='none'" style="background:transparent; border:none; color:var(--text-3); cursor:pointer; display:flex; align-items:center; justify-content:center; padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--text)';" onmouseout="this.style.color='var(--text-3)';"><i data-lucide="x" style="width:20px;height:20px"></i></button>
+        </div>
+      </div>
+    <div style="padding:20px; flex:1; overflow-y:auto;">
+      <textarea id="log-content" readonly style="width:100%; height:400px; background:rgba(0,0,0,0.5); border:1px solid var(--card-border); border-radius:var(--radius-sm); color:var(--green); font-family:monospace; font-size:12px; padding:12px; resize:none;" class="dark-scroll"></textarea>
+    </div>
+  </div>
+</div>
+
+<script>
+  window.CRF_DEFAULTS = {{ crf_defaults|tojson }};
+  window.IS_SERVER = {{ 'true' if is_server else 'false' }};
+  lucide.createIcons();
+</script>
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+  <!-- Custom Modal -->
+  <div id="custom-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-icon" id="modal-icon"></div>
+      <h3 id="modal-title" style="margin:0 0 10px 0; font-size:18px; color:var(--text); text-align:center;"></h3>
+      <p id="modal-message" style="margin:0 0 20px 0; font-size:14px; color:var(--text-2); text-align:center; line-height:1.5;"></p>
+      <div style="display:flex; gap:10px; justify-content:center; width:100%;">
+        <button id="modal-btn-cancel" class="btn btn-outline" style="flex:1;">Cancel</button>
+        <button id="modal-btn-ok" class="btn btn-primary" style="flex:1;">OK</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
 
