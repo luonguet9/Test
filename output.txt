@@ -2,14 +2,334 @@ PROJECT TREE
 ============
 
 │   ├── app/
+│   │   ├── encoder.py
 │   │   ├── utils.py
 │   │   ├── static/
 │   │   │   ├── js/
-│   │   │   │   ├── tabs/
-│   │   │   │   │   ├── compress.js
+│   │   │   │   ├── state.js
+│   │   ├── templates/
+│   │   │   ├── index.html
 │   │   ├── workers/
 │   │   │   ├── compress.py
+│   │   │   ├── social.py
 
+
+===== FILE: app/encoder.py =====
+import subprocess, threading, time, os
+from app.config import FFMPEG_BIN, _cpu_cores, _cpu_h_slots, _GPU_ENCS, _CPU_AV1_ENCS
+from app.platform_utils import free_ram_mb
+
+
+class _AdaptiveCPUSemaphore:
+    """
+    Limits CPU-encoder job parallelism based on:
+    1. Hard slot count (max concurrent jobs)
+    2. Free system RAM (must keep > keep_ram_mb free before starting a new job)
+
+    libx265 encoding 4K 10-bit 4:2:2 needs ~3 GB RAM per instance.
+    Without this guard, a batch of 4K files causes concurrent malloc failures
+    and "memory allocation failure, aborting encode" from x265.
+    """
+    def __init__(self, max_slots: int, keep_ram_mb: int = 2500):
+        self._max        = max_slots
+        self._keep_ram   = keep_ram_mb
+        self._lock       = threading.Lock()
+        self._count      = 0
+        self._last_acq   = 0.0
+
+    def acquire(self):
+        first = True
+        while True:
+            if not first:
+                time.sleep(2.0)
+            first = False
+            # Stagger concurrent acquires by 0.5 s to avoid thundering-herd
+            with self._lock:
+                elapsed = time.time() - self._last_acq
+            if elapsed < 0.5:
+                time.sleep(0.5 - elapsed)
+            with self._lock:
+                if self._count < self._max and free_ram_mb() > self._keep_ram:
+                    self._count += 1
+                    self._last_acq = time.time()
+                    return
+
+    def release(self):
+        with self._lock:
+            self._count = max(0, self._count - 1)
+
+    def __enter__(self):    self.acquire()
+    def __exit__(self, *_): self.release()
+
+class _AdaptiveGPUSemaphore:
+    """
+    Limits GPU job parallelism based on:
+    1. Hard slot count (max concurrent jobs)
+    2. Free VRAM (> 10% total VRAM)
+    3. System RAM (> 2GB reserved)
+    """
+    def __init__(self, max_slots=4, keep_vram_pct=0.10):
+        self._max          = max_slots
+        self._keep_vram_pct = keep_vram_pct
+        self._lock         = threading.Lock()
+        self._count        = 0
+        self._last_acquire = 0.0
+
+    def _vram_stats(self):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=memory.free,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2
+            )
+            if r.returncode == 0:
+                free_l, total_l = [], []
+                for line in r.stdout.strip().splitlines():
+                    parts = line.split(',')
+                    if len(parts) >= 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                        free_l.append(int(parts[0].strip()))
+                        total_l.append(int(parts[1].strip()))
+                if free_l and total_l:
+                    return min(free_l), min(total_l)
+        except Exception:
+            pass
+        return None, None
+
+    def acquire(self):
+        first = True
+        while True:
+            if not first:
+                time.sleep(1.5)
+            first = False
+            with self._lock:
+                elapsed = time.time() - self._last_acquire
+            if elapsed < 0.5:
+                time.sleep(0.5 - elapsed)
+
+            vram_free, vram_total = self._vram_stats()
+
+            with self._lock:
+                req_vram  = vram_total * self._keep_vram_pct if vram_total else 800
+                has_vram  = vram_free is None or vram_free > req_vram
+                has_sys_ram = free_ram_mb() > 2000
+
+                if self._count < self._max and has_vram and has_sys_ram:
+                    self._count += 1
+                    self._last_acquire = time.time()
+                    return
+
+    def release(self):
+        with self._lock:
+            self._count = max(0, self._count - 1)
+
+    def __enter__(self):    self.acquire()
+    def __exit__(self, *_): self.release()
+
+
+def _auto_gpu_slots(vram_per_job_mb: int = 1800, min_slots: int = 1, max_slots: int = 8) -> int:
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0:
+            totals = [int(x.strip()) for x in r.stdout.strip().splitlines() if x.strip().isdigit()]
+            if totals:
+                total_mb   = min(totals)
+                usable_mb  = int(total_mb * 0.85)
+                slots      = max(min_slots, min(max_slots, usable_mb // vram_per_job_mb))
+                print(f"  GPU VRAM detected: {total_mb} MB → {slots} concurrent encode slots")
+                return slots
+    except Exception:
+        pass
+    print("  GPU VRAM: cannot read, using default 2 slots")
+    return 2
+
+
+_gpu_slots        = _auto_gpu_slots()
+gpu_semaphore     = _AdaptiveGPUSemaphore(max_slots=_gpu_slots)
+cpu_h_semaphore   = threading.Semaphore(_cpu_h_slots)
+cpu_av1_semaphore = threading.Semaphore(1)
+light_semaphore   = threading.Semaphore(2)
+
+
+def _pick_sem(enc: str):
+    if enc in _GPU_ENCS:     return gpu_semaphore
+    if enc in _CPU_AV1_ENCS: return cpu_av1_semaphore
+    return cpu_h_semaphore
+
+
+def _test_enc(codec):
+    if not FFMPEG_BIN: return False
+    r = subprocess.run(
+        [FFMPEG_BIN,
+         "-f", "lavfi", "-i", "nullsrc=s=256x256",
+         "-t", "0.1",
+         "-pix_fmt", "yuv420p",
+         "-c:v", codec,
+         "-f", "null", "-"],
+        capture_output=True, text=True, timeout=10
+    )
+    return r.returncode == 0
+
+
+def _detect_gpu() -> dict:
+    candidates = [
+        ("av1_nvenc",  "NVIDIA", "AV1"),
+        ("av1_amf",    "AMD",    "AV1"),
+        ("av1_qsv",    "Intel",  "AV1"),
+        ("hevc_nvenc", "NVIDIA", "H.265"),
+        ("hevc_amf",   "AMD",    "H.265"),
+        ("hevc_qsv",   "Intel",  "H.265"),
+        ("h264_nvenc", "NVIDIA", "H.264"),
+        ("h264_amf",   "AMD",    "H.264"),
+        ("h264_qsv",   "Intel",  "H.264"),
+    ]
+    found, seen = {}, set()
+    for codec, vendor, fmt in candidates:
+        key = (vendor, fmt)
+        if key not in seen and _test_enc(codec):
+            seen.add(key)
+            found[codec] = {"vendor": vendor, "format": fmt}
+    return found
+
+
+GLOBAL_GPU_INFO     = None
+GLOBAL_DEFAULT_ENC  = None
+GLOBAL_ENC_GROUPS   = None
+
+
+def get_gpu_info():
+    global GLOBAL_GPU_INFO, GLOBAL_DEFAULT_ENC, GLOBAL_ENC_GROUPS
+    if GLOBAL_GPU_INFO is None:
+        GLOBAL_GPU_INFO    = _detect_gpu()
+        GLOBAL_DEFAULT_ENC = _get_default_encoder(GLOBAL_GPU_INFO)
+        GLOBAL_ENC_GROUPS  = _build_encoder_options(GLOBAL_GPU_INFO)
+    return GLOBAL_GPU_INFO, GLOBAL_DEFAULT_ENC, GLOBAL_ENC_GROUPS
+
+
+def _get_default_encoder(gpu: dict) -> str:
+    for enc in ["av1_nvenc", "av1_amf"]:
+        if enc in gpu: return enc
+    for enc in ["hevc_nvenc", "hevc_amf"]:
+        if enc in gpu: return enc
+    return "libx265"
+
+
+def _build_encoder_options(gpu: dict) -> list:
+    groups = []
+
+    for codec, info in gpu.items():
+        if info["format"] == "AV1" and "qsv" not in codec:
+            groups.append({
+                "group":   f"<i data-lucide=\"rocket\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> {info['vendor']} GPU — AV1",
+                "warning": False,
+                "encoders": [{"codec": codec,
+                    "label": f"{info['vendor']} AV1 — Fastest + smallest"}]
+            })
+
+    for codec, info in gpu.items():
+        if info["format"] == "H.265" and "qsv" not in codec:
+            groups.append({
+                "group":   f"<i data-lucide=\"rocket\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> {info['vendor']} GPU — H.265",
+                "warning": False,
+                "encoders": [{"codec": codec,
+                    "label": f"{info['vendor']} H.265 — Fast, low CPU usage <i data-lucide=\"star\" style=\"width:14px;height:14px;vertical-align:-2px;color:var(--yellow)\"></i>"}]
+            })
+
+    groups.append({
+        "group":   "<i data-lucide=\"cpu\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> CPU",
+        "warning": False,
+        "encoders": [
+            {"codec": "libx265",
+             "label": "H.265 / HEVC — Recommended <i data-lucide=\"check-circle-2\" style=\"width:16px;height:16px;vertical-align:-2px;color:var(--green)\"></i>"},
+            {"codec": "libx264",
+             "label": "H.264 — Highest compatibility"},
+        ]
+    })
+
+    av1_enc = []
+    if _test_enc("libsvtav1"):
+        av1_enc += [
+            {"codec": "libsvtav1",
+             "label": "SVT-AV1 preset 6 — ~25% smaller than H.265"},
+            {"codec": "libsvtav1_p4",
+             "label": "SVT-AV1 preset 4 — Higher quality, slower"},
+        ]
+    av1_enc.append({"codec": "libaom-av1", "label": "libaom-AV1 — Slowest"})
+    groups.append({
+        "group":   "<i data-lucide=\"cpu\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> CPU — AV1 (smaller than H.265, slower)",
+        "warning": False,
+        "encoders": av1_enc
+    })
+
+    for codec, info in gpu.items():
+        if info["format"] == "H.264" and "qsv" not in codec:
+            groups.append({
+                "group":   f"<i data-lucide=\"rocket\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> {info['vendor']} GPU — H.264",
+                "warning": False,
+                "encoders": [{"codec": codec,
+                    "label": f"{info['vendor']} H.264"}]
+            })
+
+    has_discrete_gpu = any("qsv" not in c for c in gpu)
+    if not has_discrete_gpu:
+        qsv_encs = [
+            {"codec": c,
+             "label": f"Intel QSV {i['format']} — Faster than CPU"}
+            for c, i in gpu.items() if "qsv" in c
+        ]
+        if qsv_encs:
+            groups.append({
+                "group":   "<i data-lucide=\"zap\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> Intel QSV — Faster than CPU, lower quality",
+                "warning": True,
+                "encoders": qsv_encs
+            })
+
+    return groups
+
+
+def _get_codec_family(enc: str) -> str:
+    if "av1"  in enc: return "av1"
+    if "265"  in enc or "hevc" in enc: return "h265"
+    return "h264"
+
+
+def _get_real_enc_extra(enc: str) -> tuple:
+    # film-grain=6: SVT-AV1 analyses source grain, denoises, re-synthesises at decode.
+    # On clean video: no grain detected → no synthesis → safe. On iPhone footage: 20-30% smaller.
+    _svtav1_fg = f"lp={_cpu_cores}:film-grain=6:film-grain-denoise=1"
+    if enc == "libsvtav1_p4": return "libsvtav1", ["-preset","4","-svtav1-params",_svtav1_fg]
+    if enc == "libsvtav1":    return "libsvtav1", ["-preset","6","-svtav1-params",_svtav1_fg]
+    if enc in ("libx265", "libx264"):
+        return enc, ["-preset", "medium"]
+    if enc == "libaom-av1":
+        return enc, ["-cpu-used","6","-row-mt","1","-tiles","4x4"]
+    return enc, []
+
+
+def _quality_args(enc: str, crf: int) -> list:
+    # h264/hevc nvenc: uncapped VBR + HQ tune + Adaptive Quantization.
+    # av1_nvenc: -tune hq already enables AQ; -spatial_aq/-temporal_aq not supported on AV1 NVENC.
+    if enc in ("h264_nvenc","hevc_nvenc"):
+        return ["-rc","vbr","-cq",str(crf),"-b:v","0",
+                "-tune","hq","-spatial_aq","1","-temporal_aq","1","-aq-strength","15"]
+    if enc == "av1_nvenc":
+        return ["-rc","vbr","-cq",str(crf),"-b:v","0","-tune","hq"]
+    if enc in ("h264_amf","hevc_amf"):
+        return ["-rc","cqp","-qp",str(crf)]
+    if enc == "av1_amf":
+        return ["-rc","qvbr","-qvbr_quality_level",str(crf)]
+    if enc in ("h264_qsv","hevc_qsv","av1_qsv"):
+        return ["-global_quality",str(crf),"-look_ahead","1","-b:v","0"]
+    return ["-crf",str(crf),"-b:v","0"]
+
+
+def _hwaccel_args(enc: str) -> list:
+    if enc in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    return []
 
 ===== FILE: app/utils.py =====
 import os, re, json, struct, subprocess, datetime, threading, shutil
@@ -33,6 +353,30 @@ def _resolve_upload_file(server_file: str):
     except ValueError:
         return None
     return p
+
+def _get_upload(request, job_id):
+    """Resolve upload source. Returns (src_path, orig_name).
+    For server_file: resolves existing temp path (from /api/probe).
+    For request.files: saves uploaded file to UPLOAD_DIR.
+    Raises ValueError with user-facing message on invalid input."""
+    server_file = request.form.get("server_file")
+    if server_file:
+        orig_name = request.form.get("original_name") or ""
+        tmp_p = _resolve_upload_file(server_file)
+        if tmp_p is None:
+            raise ValueError("Invalid file path!")
+        if not tmp_p.exists():
+            raise ValueError("Uploaded file was lost! Please reselect.")
+        if not orig_name:
+            raise ValueError("Missing original filename!")
+        return tmp_p, orig_name
+    f = request.files.get("file")
+    if not f:
+        raise ValueError("No file uploaded!")
+    orig_name = _sanitize_upload_filename(f.filename)
+    src_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{job_id}{Path(orig_name).suffix}"
+    f.save(str(src_path))
+    return src_path, orig_name
 
 def _check_disk_space():
     total, used, free = shutil.disk_usage(UPLOAD_DIR)
@@ -74,6 +418,18 @@ def _probe(path):
     try: return json.loads(r.stdout)
     except: return {}
 
+def _get_rotation(stream: dict) -> int:
+    """Return display rotation (0/90/180/270) from a video stream dict."""
+    if "rotate" in stream.get("tags", {}):
+        try: return abs(int(stream["tags"]["rotate"]))
+        except: pass
+    for sd in stream.get("side_data_list", []):
+        if sd.get("side_data_type") == "Display Matrix":
+            try: return abs(int(sd.get("rotation", 0)))
+            except: pass
+    return 0
+
+
 def _extract_ui_meta(tmp_path):
     data = _probe(str(tmp_path))
     info = {"duration": "N/A", "codec": "N/A", "res": "N/A", "fps": "N/A", "audio": "N/A"}
@@ -89,15 +445,7 @@ def _extract_ui_meta(tmp_path):
             raw = s.get("codec_name", "").lower()
             info["codec"] = CODEC_LABELS.get(raw, raw.upper())
             w, h = s.get('width', '?'), s.get('height', '?')
-            rotation = 0
-            if "rotate" in s.get("tags", {}):
-                try: rotation = abs(int(s["tags"]["rotate"]))
-                except: pass
-            else:
-                for sd in s.get("side_data_list", []):
-                    if sd.get("side_data_type") == "Display Matrix":
-                        try: rotation = abs(int(sd.get("rotation", 0)))
-                        except: pass
+            rotation = _get_rotation(s)
             if rotation in (90, 270) and w != '?' and h != '?': info["res"] = f"{h}x{w}"
             else: info["res"] = f"{w}x{h}"
             r = s.get("r_frame_rate", "0/1")
@@ -170,14 +518,273 @@ def _read_progress(fpath):
         return t, done
     except: return 0.0, False
 
-def _sync_meta(src: str, dst: str) -> bool:
+# Critical Apple proprietary keys that ExifTool may silently re-encode as UTF-8.
+# Mapped to short display labels shown in the metadata comparison modal.
+# Also used as the canonical list for binary injection (_APPLE_KEYS_TO_PRESERVE below).
+_QT_KEYS_CRITICAL = {
+    "com.apple.quicktime.front-and-back-camera-composition":   "Dual Camera",
+    "com.apple.quicktime.action-video.stabilization-strength": "Action Mode",
+    "com.apple.quicktime.metadata.1":                          "Metadata.1",
+    "com.apple.quicktime.full-frame-rate-playback-intent":     "Full Frame Rate",
+}
+_QT_TYPE_NAMES = {0x01: "utf8", 0x15: "int", 0x00: "binary"}
+
+# Apple proprietary QuickTime Keys that ExifTool cannot write (read-only in its DB).
+# Derived from _QT_KEYS_CRITICAL — single source of truth.
+_APPLE_KEYS_TO_PRESERVE = list(_QT_KEYS_CRITICAL.keys())
+
+
+def _inject_apple_keys(src: str, dst: str, key_names: list) -> bool:
+    """
+    Binary-inject specific Apple QuickTime Keys from src into dst.
+
+    QuickTime Keys live in moov→udta→meta(FullBox)→keys+ilst.
+    ExifTool rewrites these boxes and drops tags it doesn't know.
+    This function appends the missing entries at the binary level.
+
+    keys box:  [size][keys][ver/flags(4)][count(4)] [entry: size+namespace+'mdta'+name]*
+    ilst box:  [size][ilst]              [item: size+1basedIdx+data_box]*
+    """
+    if not key_names:
+        return False
+    try:
+        # Source: read only the moov box (source file may not be faststart → moov at end).
+        # Seeking past non-moov boxes is O(1), avoiding loading 4 GB into RAM.
+        src_b = None
+        with open(src, 'rb') as f:
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8: break
+                sz = struct.unpack_from('>I', hdr, 0)[0]
+                fc = hdr[4:8]
+                hdr_len = 8
+                if sz == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8: break
+                    sz = struct.unpack_from('>Q', ext, 0)[0]; hdr_len = 16
+                if sz < hdr_len: break
+                body_len = sz - hdr_len
+                if fc == b'moov':
+                    src_b = hdr + (ext if hdr_len == 16 else b'') + f.read(body_len)
+                    break
+                f.seek(body_len, 1)
+        if not src_b:
+            return False
+        with open(dst, 'rb') as f:
+            dst_b = bytearray(f.read())
+    except OSError:
+        return False
+
+    def find_meta_chain(data):
+        ms, me = _mp4_find_in_range(data, 0, len(data), b'moov')
+        if ms < 0: return None
+        # Scan direct moov children only (no DFS) to find meta and udta separately.
+        us = ue = direct_ms = direct_me = -1
+        for fc, ds, be in _mp4_walk_top(data, ms + 8, me):
+            if fc == b'udta' and us < 0: us, ue = ds - 8, be
+            elif fc == b'meta' and direct_ms < 0: direct_ms, direct_me = ds - 8, be
+        # Prefer moov→meta Regular Box (QuickTime native) — iOS reads this, not udta→meta.
+        # Regular Box: fourcc of first child at +12 is a printable fourcc (hdlr/keys/ilst).
+        # Full Box:    version+flags at +8, child size at +12 (high byte = 0x00, non-ASCII).
+        mts = mte = -1
+        if direct_ms >= 0:
+            fc_probe = bytes(data[direct_ms + 12: direct_ms + 16]) if direct_ms + 16 <= direct_me else b''
+            if fc_probe in (b'keys', b'ilst', b'hdlr'):
+                mts, mte = direct_ms, direct_me  # QuickTime Regular Box
+        if mts < 0 and us >= 0:
+            mts, mte = _mp4_find_in_range(data, us + 8, ue, b'meta')  # fallback: udta→meta
+        if mts < 0 and direct_ms >= 0:
+            mts, mte = direct_ms, direct_me  # last resort: Full Box moov→meta
+        if mts < 0: return None
+        # meta can be a regular box (children at mts+8, QuickTime native) or a
+        # Full Box (children at mts+12, ISOBMFF). Detect by checking the first
+        # child's fourcc at each candidate offset.
+        cstart = mts + 12  # default: Full Box
+        if mts + 8 + 8 <= mte:
+            fc_probe = bytes(data[mts + 8 + 4: mts + 8 + 8])
+            if fc_probe in (b'keys', b'ilst', b'hdlr'):
+                cstart = mts + 8   # regular box
+        ks = ke = is_ = ie = -1
+        for fc, ds, be in _mp4_walk_top(data, cstart, mte):
+            if fc == b'keys': ks, ke = ds-8, be
+            elif fc == b'ilst': is_, ie = ds-8, be
+        # meta_in_udta: True only when meta is a child of udta (not a sibling).
+        # When False, udta size must NOT be updated when meta grows.
+        meta_in_udta = us >= 0 and mts > us and mts < ue
+        return dict(moov=(ms, me), udta=(us, ue), meta=(mts, mte),
+                    keys=(ks, ke), ilst=(is_, ie), meta_in_udta=meta_in_udta)
+
+    def read_keys(data, ks, ke):
+        if ks < 0 or ks+16 > len(data): return []
+        count = struct.unpack_from('>I', data, ks+12)[0]
+        pos, res = ks+16, []
+        for i in range(count):
+            if pos+8 > min(ke, len(data)): break
+            esz = struct.unpack_from('>I', data, pos)[0]
+            if esz < 8 or pos+esz > len(data): break
+            name = bytes(data[pos+8:pos+esz]).decode('utf-8', errors='replace')
+            res.append((name, bytes(data[pos:pos+esz]), i+1))
+            pos += esz
+        return res
+
+    def read_ilst(data, is_, ie):
+        if is_ < 0: return {}
+        pos, items = is_+8, {}
+        while pos+8 <= min(ie, len(data)):
+            isz = struct.unpack_from('>I', data, pos)[0]
+            idx = struct.unpack_from('>I', data, pos+4)[0]
+            if isz < 8 or pos+isz > len(data): break
+            items[idx] = bytes(data[pos:pos+isz])
+            pos += isz
+        return items
+
+    # Parse source
+    sc = find_meta_chain(src_b)
+    if not sc or sc['keys'][0] < 0: return False
+    src_keys = read_keys(src_b, *sc['keys'])
+    src_ilst = read_ilst(src_b, *sc['ilst'])
+    src_lut = {}
+    for name, entry_b, idx in src_keys:
+        if name in key_names and idx in src_ilst:
+            src_lut[name] = (entry_b, src_ilst[idx][8:])  # entry bytes + ilst payload
+
+    if not src_lut: return False
+
+    # Parse destination
+    dc = find_meta_chain(dst_b)
+    if not dc or dc['keys'][0] < 0: return False
+    dst_keys = read_keys(dst_b, *dc['keys'])
+    existing = {n for n, _, _ in dst_keys}
+    n_existing = len(dst_keys)
+    dst_ilst = read_ilst(dst_b, *dc['ilst'])
+
+    to_add = [(n, src_lut[n]) for n in key_names if n in src_lut and n not in existing]
+
+    # Keys present in dst but with wrong payload (e.g. ExifTool wrote as UTF-8 string
+    # instead of the original binary integer — it doesn't know the proprietary type).
+    dst_key_idx = {n: i for n, _, i in dst_keys}
+    to_replace = []
+    for name in key_names:
+        if name in src_lut and name in existing:
+            di = dst_key_idx.get(name)
+            if di is not None and di in dst_ilst:
+                _, src_pl = src_lut[name]
+                if dst_ilst[di][8:] != src_pl:
+                    to_replace.append((di, src_pl))
+
+    # Both additions and replacements require an existing ilst box.
+    # Creating ilst from scratch would require restructuring meta — not done here.
+    if dc['ilst'][0] < 0:
+        to_add = []
+        to_replace = []
+    if not to_add and not to_replace: return True  # already present with correct values
+
+    # Build new bytes for additions
+    new_keys_b = b''.join(eb for _, (eb, _) in to_add)
+    new_ilst_b = b''
+    for i, (_, (_, payload)) in enumerate(to_add):
+        new_idx = n_existing + i + 1
+        new_ilst_b += struct.pack('>II', 8 + len(payload), new_idx) + payload
+
+    nk, ni = len(new_keys_b), len(new_ilst_b)
+    total = nk + ni
+
+    ks, ke = dc['keys']
+    is_, ie = dc['ilst']
+    mts, ms = dc['meta'][0], dc['moov'][0]
+    # Only include udta in the parent-size-update chain if meta lives inside it.
+    us = dc['udta'][0] if dc.get('meta_in_udta') else -1
+
+    # Handle replacements first (last-to-first to preserve earlier positions)
+    replace_delta = 0
+    if to_replace and is_ >= 0:
+        src_map = {di: pl for di, pl in to_replace}
+        repl_list = []
+        rpos = is_ + 8
+        while rpos + 8 <= min(ie, len(dst_b)):
+            isz = struct.unpack_from('>I', dst_b, rpos)[0]
+            if isz < 8 or rpos + isz > len(dst_b): break
+            item_idx = struct.unpack_from('>I', dst_b, rpos + 4)[0]
+            if item_idx in src_map:
+                new_item = struct.pack('>II', 8 + len(src_map[item_idx]), item_idx) + src_map[item_idx]
+                repl_list.append((rpos, rpos + isz, bytes(new_item)))
+            rpos += isz
+        repl_list.sort(reverse=True)
+        for rstart, rend, new_bytes in repl_list:
+            delta = len(new_bytes) - (rend - rstart)
+            dst_b[rstart:rend] = bytearray(new_bytes)
+            replace_delta += delta
+        if replace_delta != 0:
+            struct.pack_into('>I', dst_b, is_, struct.unpack_from('>I', dst_b, is_)[0] + replace_delta)
+            for box_s in (mts, us, ms):
+                if box_s < 0: continue
+                struct.pack_into('>I', dst_b, box_s,
+                                 struct.unpack_from('>I', dst_b, box_s)[0] + replace_delta)
+            # Adjust ie (and ks/ke if keys come after ilst)
+            if ks > ie:  # ilst precedes keys: keys positions shift too
+                ks += replace_delta
+                ke += replace_delta
+            ie += replace_delta
+
+    # Append to keys box first, then ilst (order matters for offset tracking)
+    if ie < 0 or ke <= is_:
+        # keys before ilst (or no ilst)
+        dst_b[ke:ke] = new_keys_b
+        struct.pack_into('>I', dst_b, ks, struct.unpack_from('>I', dst_b, ks)[0] + nk)
+        struct.pack_into('>I', dst_b, ks+12, n_existing + len(to_add))
+        if is_ >= 0:
+            dst_b[ie+nk:ie+nk] = new_ilst_b
+            struct.pack_into('>I', dst_b, is_+nk,
+                             struct.unpack_from('>I', dst_b, is_+nk)[0] + ni)
+    else:
+        # ilst before keys
+        dst_b[ie:ie] = new_ilst_b
+        struct.pack_into('>I', dst_b, is_, struct.unpack_from('>I', dst_b, is_)[0] + ni)
+        dst_b[ke+ni:ke+ni] = new_keys_b
+        struct.pack_into('>I', dst_b, ks+ni,
+                         struct.unpack_from('>I', dst_b, ks+ni)[0] + nk)
+        struct.pack_into('>I', dst_b, ks+ni+12, n_existing + len(to_add))
+
+    # Update parent box sizes: meta → udta (if present) → moov
+    for box_s in (mts, us, ms):
+        if box_s < 0: continue
+        struct.pack_into('>I', dst_b, box_s,
+                         struct.unpack_from('>I', dst_b, box_s)[0] + total)
+
+    # Update stco/co64 chunk offsets when moov precedes mdat (faststart)
+    mdat_s = -1
+    for fc, ds, be in _mp4_walk_top(dst_b, 0, len(dst_b)):
+        if fc == b'mdat': mdat_s = ds-8; break
+    total_delta = replace_delta + total
+    if ms >= 0 and mdat_s >= 0 and ms < mdat_s and total_delta != 0:
+        # Use earliest modification: replacements are within ilst; additions start at ke
+        if to_replace and is_ >= 0:
+            first_ins = is_ + 8
+        elif ie >= 0:
+            first_ins = min(ke, ie)
+        else:
+            first_ins = ke
+        _mp4_shift_offsets(dst_b, first_ins, total_delta)
+
+    tmp = dst + '._iak_tmp'
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(bytes(dst_b))
+        os.replace(tmp, dst)
+        return True
+    except OSError:
+        try: os.unlink(tmp)
+        except: pass
+        return False
+
+
+def _sync_meta(src: str, dst: str, rotation: int = 0) -> bool:
     if not EXIFTOOL_BIN: return False
 
     # Step 1: Copy critical Apple QuickTime Keys atoms explicitly.
-    # IMPORTANT: Do NOT use -Keys:all here — it copies Keys:FocalLength (physical mm
-    # e.g. 6.765mm) which overrides the display-formatted Keys:CameraLensModel
-    # (e.g. "24 mm f/1.78") causing iOS to show wrong focal length and lose the
-    # "Apple iPhone xx" camera header (shows "Không có thông tin máy ảnh" instead).
+    # IMPORTANT: Do NOT use -Keys:all — it copies Keys:FocalLength (physical mm
+    # e.g. 6.765mm) which overrides display-formatted Keys:CameraLensModel
+    # (e.g. "24 mm f/1.78") causing iOS to show wrong focal length.
     cmd1 = [
         EXIFTOOL_BIN,
         "-api", "LargeFileSupport=1",
@@ -196,11 +803,8 @@ def _sync_meta(src: str, dst: str) -> bool:
         "-Keys:HDRVideoFormat",
         "-Keys:LocationAccuracyHorizontal",
         "-Keys:FullFrameRatePlaybackIntent",
-        "-Keys:Action-videoStabilization-strength",
         "-Keys:Metadata1",
-        "-Keys:Front-and-back-camera-composition",
-        # Mirror critical Keys into legacy UserData atoms (compatibility with older
-        # players and iOS versions that read Make/Model/GPS from udta, not Keys)
+        # Mirror critical Keys into legacy UserData atoms
         "-UserData:Make<Keys:Make",
         "-UserData:Model<Keys:Model",
         "-UserData:GPSCoordinates<Keys:GPSCoordinates",
@@ -208,7 +812,11 @@ def _sync_meta(src: str, dst: str) -> bool:
         "-overwrite_original",
         dst
     ]
-    r1 = subprocess.run(cmd1, capture_output=True, text=True)
+    r1 = None
+    try:
+        r1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
 
     # Step 2: Copy all remaining metadata (excluding Keys to avoid overwriting step 1).
     cmd2 = [
@@ -217,35 +825,160 @@ def _sync_meta(src: str, dst: str) -> bool:
         "-api", "QuickTimeUTC=1",
         "-tagsfromfile", src,
         "-all:all",
+        "-Rotation",
+        "-MatrixStructure",
         "--FileModifyDate",
         "--FileCreateDate",
-        "--Keys:all",       # Exclude Keys — already handled in step 1
+        "--Keys:all",
         "-overwrite_original",
         dst
     ]
-    r2 = subprocess.run(cmd2, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r2 = None
+    try:
+        r2 = subprocess.run(cmd2, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
 
-    return r1.returncode == 0 or r2.returncode == 0
+    # Step 3: Binary-inject proprietary Apple Keys that ExifTool doesn't know.
+    # ExifTool rewrites the Keys/ilst box and drops tags not in its database
+    # (e.g. front-and-back-camera-composition, action-video.stabilization-strength).
+    # We restore them directly from the source file at the binary level.
+    _inject_apple_keys(src, dst, _APPLE_KEYS_TO_PRESERVE)
+
+    # Step 4: Move moov→udta→meta to moov→meta (direct child).
+    # iOS Photos requires QuickTime Keys (front-and-back-camera-composition,
+    # action-video.stabilization-strength, etc.) at moov→meta (QuickTime native
+    # position). ExifTool writes to moov→udta→meta, which iOS ignores for these keys.
+    _promote_udta_meta_to_moov(dst)
+
+    if rotation:
+        cmd_rot = [
+            EXIFTOOL_BIN,
+            f"-Rotation={rotation}",
+            "-overwrite_original",
+            dst
+        ]
+        try:
+            subprocess.run(cmd_rot, capture_output=True, timeout=15)
+        except:
+            pass
+
+    return bool(r1 and r1.returncode == 0) or bool(r2 and r2.returncode == 0)
 
 
-def _detect_action_mode(path: str) -> bool:
-    """Detect iPhone Action Mode via ExifTool Keys:CaptureMode atom.
-    Returns True if the video was recorded with Action Mode (EIS stabilization)."""
-    if not EXIFTOOL_BIN:
+def _promote_udta_meta_to_moov(path: str) -> bool:
+    """
+    Ensure the Keys meta box is a Regular Box direct child of moov.
+
+    iOS Photos requires QuickTime Keys (front-and-back-camera-composition etc.)
+    at moov→meta (Regular Box, no version+flags).  ExifTool may write either:
+      - moov→udta→meta (wrong location) or
+      - moov→meta as Full Box (wrong format — version+flags read as terminator)
+    We fix both cases here, adjusting stco/co64 offsets when the file shrinks.
+    """
+    _MAX_LOAD_MB = 500
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size > _MAX_LOAD_MB * 1024 * 1024:
+        import warnings
+        warnings.warn(
+            f"_promote_udta_meta_to_moov: skipping {path!r} ({size // 1024 // 1024} MB > {_MAX_LOAD_MB} MB limit) "
+            "— iOS QuickTime Keys metadata may not be promoted. "
+            "Dual Camera / Action Mode icons in Photos may be missing.",
+            stacklevel=2
+        )
         return False
     try:
-        r = subprocess.run(
-            [EXIFTOOL_BIN, "-api", "LargeFileSupport=1", "-j",
-             "-Keys:CaptureMode",
-             str(path)],
-            capture_output=True, text=True, timeout=10
-        )
-        data = json.loads(r.stdout or "[]")
-        if not data:
+        with open(path, 'rb') as f:
+            data = bytearray(f.read())
+    except OSError:
+        return False
+
+    def _is_full(mts):
+        """True if meta box at mts is a Full Box (has 4-byte version+flags after header)."""
+        probe = bytes(data[mts + 12: mts + 16]) if mts + 16 <= len(data) else b''
+        return probe not in (b'hdlr', b'keys', b'ilst')
+
+    def _to_regular(mts, mte):
+        """Return bytes of meta converted from Full Box to Regular Box (removes 4 bytes)."""
+        return struct.pack('>I', mte - mts - 4) + b'meta' + bytes(data[mts + 12: mte])
+
+    # Find moov
+    moov_s = moov_e = -1
+    for fc, ds, be in _mp4_walk_top(data, 0, len(data)):
+        if fc == b'moov':
+            moov_s, moov_e = ds - 8, be
+            break
+    if moov_s < 0:
+        return False
+
+    # Scan top-level moov children for meta and udta
+    moov_meta_s = moov_meta_e = udta_s = udta_e = -1
+    for fc, ds, be in _mp4_walk_top(data, moov_s + 8, moov_e):
+        if fc == b'meta' and moov_meta_s < 0:
+            moov_meta_s, moov_meta_e = ds - 8, be
+        elif fc == b'udta' and udta_s < 0:
+            udta_s, udta_e = ds - 8, be
+
+    # --- Case 1: meta already at moov level ---
+    if moov_meta_s >= 0:
+        if not _is_full(moov_meta_s):
+            return False  # already Regular Box at moov level — nothing to do
+        # Full Box at moov level: convert in-place (removes 4 bytes)
+        new_meta = _to_regular(moov_meta_s, moov_meta_e)
+        data = data[:moov_meta_s] + bytearray(new_meta) + data[moov_meta_e:]
+        struct.pack_into('>I', data, moov_s, moov_e - moov_s - 4)  # moov shrinks 4
+        # mdat shifted 4 bytes earlier; fix stco/co64
+        _mp4_shift_offsets(data, moov_e - 4, -4)
+
+    # --- Case 2: meta inside udta, not yet at moov level ---
+    elif udta_s >= 0:
+        # Find meta inside udta
+        udta_meta_s = udta_meta_e = -1
+        for fc, ds, be in _mp4_walk_top(data, udta_s + 8, udta_e):
+            if fc == b'meta':
+                udta_meta_s, udta_meta_e = ds - 8, be
+                break
+        if udta_meta_s < 0:
             return False
-        capture_mode = str(data[0].get("CaptureMode", "")).lower()
-        return "action" in capture_mode
-    except Exception:
+
+        meta_size = udta_meta_e - udta_meta_s
+        if _is_full(udta_meta_s):
+            new_meta = _to_regular(udta_meta_s, udta_meta_e)
+            net = -4
+        else:
+            new_meta = bytes(data[udta_meta_s: udta_meta_e])
+            net = 0
+
+        # Remove meta from udta
+        data = data[:udta_meta_s] + data[udta_meta_e:]
+        struct.pack_into('>I', data, udta_s, udta_e - udta_s - meta_size)
+
+        # Insert at end of moov
+        insert_pos = moov_e - meta_size
+        data = data[:insert_pos] + bytearray(new_meta) + data[insert_pos:]
+
+        # Update moov size and fix stco if file shrank
+        struct.pack_into('>I', data, moov_s, (moov_e - moov_s) + net)
+        if net != 0:
+            _mp4_shift_offsets(data, insert_pos + len(new_meta), net)
+
+    else:
+        return False
+
+    tmp = path + '._promo_tmp'
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(bytes(data))
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
         return False
 
 
@@ -263,34 +996,211 @@ def _detect_dolby_vision(probe_data) -> bool:
     return _get_dv_info(probe_data)[0]
 
 
-def _get_exif_snapshot(path) -> dict:
-    """Run ExifTool on path, return selected Apple Keys atoms + HDR metadata.
-    Uses an explicit field list — NOT -Keys:all — to avoid copying Keys:FocalLength
-    (physical mm, e.g. 6.765mm) which conflicts with the display-formatted
-    Keys:CameraLensModel atom (e.g. '24 mm f/1.78') causing iOS to show wrong
-    focal length and lose the device camera header."""
-    if not EXIFTOOL_BIN:
+def _fix_mebx_tracks(dst: str) -> bool:
+    """
+    Binary-patch mebx track metadata corrupted by FFmpeg's 'unknown hdlr_type' warning.
+    FFmpeg copies Apple mebx (Core Media Metadata) tracks but writes wrong
+    hdlr.handler_type and stsd entry fourcc (both become 'stts' instead of 'mebx').
+    Patches them back to b'mebx' for all tracks whose handler_name contains
+    'Core Media Metadata'. Returns True if at least one track was patched.
+    """
+    try:
+        with open(dst, 'rb') as f:
+            buf = bytearray(f.read())
+    except OSError:
+        return False
+
+    moov_s = moov_e = -1
+    for fc, ds, be in _mp4_walk_top(buf, 0, len(buf)):
+        if fc == b'moov':
+            moov_s, moov_e = ds - 8, be
+            break
+    if moov_s < 0:
+        return False
+
+    patched = 0
+    for fc, ds, be in _mp4_walk_top(buf, moov_s + 8, moov_e):
+        if fc != b'trak':
+            continue
+
+        # hdlr box: [size(4)][hdlr(4)][ver/flags(4)][pre_defined(4)][handler_type(4)][reserved(12)][name...]
+        hdlr_s, _ = _mp4_find_in_range(buf, ds, be, b'hdlr')
+        if hdlr_s < 0 or hdlr_s + 32 > len(buf):
+            continue
+
+        # handler_name (null-terminated C string) starts at offset 32 from box start
+        chunk = bytes(buf[hdlr_s + 32: min(hdlr_s + 200, len(buf))])
+        null_pos = chunk.find(b'\x00')
+        handler_name = chunk[:null_pos] if null_pos >= 0 else chunk
+        if b'Core Media Metadata' not in handler_name:
+            continue
+
+        # Patch handler_type at offset 16 from box start.
+        # Source iPhone MOV uses 'meta' (QuickTime metadata handler), not 'mebx'.
+        if bytes(buf[hdlr_s + 16: hdlr_s + 20]) != b'meta':
+            buf[hdlr_s + 16: hdlr_s + 20] = b'meta'
+            patched += 1
+
+        # stsd box: [size(4)][stsd(4)][ver/flags(4)][entry_count(4)][entry_size(4)][entry_fourcc(4)...]
+        # entry1 fourcc is at offset 20 from stsd box start
+        stsd_s, _ = _mp4_find_in_range(buf, ds, be, b'stsd')
+        if stsd_s >= 0 and stsd_s + 24 <= len(buf):
+            if bytes(buf[stsd_s + 20: stsd_s + 24]) != b'mebx':
+                buf[stsd_s + 20: stsd_s + 24] = b'mebx'
+                patched += 1
+
+    if not patched:
+        return False
+
+    tmp = dst + '._mebx_tmp'
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(bytes(buf))
+        os.replace(tmp, dst)
+        return True
+    except OSError:
+        try: os.unlink(tmp)
+        except: pass
+        return False
+
+
+def _read_qt_keys_critical(path: str) -> dict:
+    """
+    Read binary type + value of critical Apple QuickTime Keys directly from the file.
+    ExifTool converts these binary-integer keys to UTF-8 strings and loses type info.
+    Returns dict of display label → type-annotated string, e.g.:
+        {"Apple Key: Dual Camera": "1 (int)", "Apple Key: Action Mode": "4 (utf8)"}
+
+    Only the moov box is read into memory (seek past mdat/ftyp headers), so this
+    is safe even for 4 GB source files.
+    """
+    try:
+        moov_data = None
+        with open(path, 'rb') as f:
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                sz = struct.unpack_from('>I', hdr, 0)[0]
+                fc = hdr[4:8]
+                hdr_len = 8
+                if sz == 1:                        # extended 64-bit size
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    sz = struct.unpack_from('>Q', ext, 0)[0]
+                    hdr_len = 16
+                if sz < hdr_len:
+                    break
+                body_len = sz - hdr_len
+                if fc == b'moov':
+                    moov_data = hdr + (ext if hdr_len == 16 else b'') + f.read(body_len)
+                    break
+                f.seek(body_len, 1)               # skip non-moov boxes (O(1) even for huge mdat)
+    except OSError:
         return {}
+
+    if not moov_data:
+        return {}
+
+    ms, me = _mp4_find_in_range(moov_data, 0, len(moov_data), b'moov')
+    if ms < 0: return {}
+
+    # Prefer moov→meta Regular Box (QuickTime native, iOS reads this) over udta→meta.
+    us = ue = direct_ms = direct_me = -1
+    for fc, ds, be in _mp4_walk_top(moov_data, ms + 8, me):
+        if fc == b'udta' and us < 0: us, ue = ds - 8, be
+        elif fc == b'meta' and direct_ms < 0: direct_ms, direct_me = ds - 8, be
+    mts = mte = -1
+    if direct_ms >= 0:
+        fc_probe = bytes(moov_data[direct_ms + 12: direct_ms + 16]) if direct_ms + 16 <= direct_me else b''
+        if fc_probe in (b'hdlr', b'keys', b'ilst'):
+            mts, mte = direct_ms, direct_me
+    if mts < 0 and us >= 0:
+        mts, mte = _mp4_find_in_range(moov_data, us + 8, ue, b'meta')
+    if mts < 0 and direct_ms >= 0:
+        mts, mte = direct_ms, direct_me
+    if mts < 0: return {}
+
+    # Regular Box (QuickTime): children start at mts+8; Full Box (ISOBMFF): mts+12
+    probe = bytes(moov_data[mts + 12: mts + 16]) if mts + 16 <= len(moov_data) else b''
+    cstart = mts + 8 if probe in (b'hdlr', b'keys', b'ilst') else mts + 12
+
+    ks = ke = is_ = ie = -1
+    for fc, ds, be in _mp4_walk_top(moov_data, cstart, mte):
+        if fc == b'keys': ks, ke = ds - 8, be
+        elif fc == b'ilst': is_, ie = ds - 8, be
+    if ks < 0 or is_ < 0: return {}
+
+    # Build index: 1-based key index → full key name (only for critical keys)
+    count = struct.unpack_from('>I', moov_data, ks + 12)[0]
+    pos, key_idx = ks + 16, {}
+    for i in range(count):
+        if pos + 8 > ke: break
+        esz = struct.unpack_from('>I', moov_data, pos)[0]
+        if esz < 8: break
+        name = moov_data[pos + 8: pos + esz].decode('utf-8', errors='replace')
+        if name in _QT_KEYS_CRITICAL:
+            key_idx[i + 1] = name
+        pos += esz
+    if not key_idx: return {}
+
+    # Parse ilst items and format type-annotated values
+    result = {}
+    pos = is_ + 8
+    while pos + 8 <= ie:
+        isz = struct.unpack_from('>I', moov_data, pos)[0]
+        if isz < 8 or pos + isz > len(moov_data): break
+        idx = struct.unpack_from('>I', moov_data, pos + 4)[0]
+        if idx in key_idx:
+            label = _QT_KEYS_CRITICAL[key_idx[idx]]
+            db = pos + 8   # start of 'data' sub-box
+            if db + 16 <= pos + isz:
+                db_sz  = struct.unpack_from('>I', moov_data, db)[0]
+                db_typ = struct.unpack_from('>I', moov_data, db + 8)[0]
+                db_val = moov_data[db + 16: db + db_sz]
+            else:
+                db_typ, db_val = -1, b''
+            tname = _QT_TYPE_NAMES.get(db_typ, f"0x{db_typ:08x}")
+            if db_typ == 0x01:    # utf8
+                val_str = db_val.decode('utf-8', errors='replace')
+            elif db_typ == 0x15:  # unsigned int (1–8 bytes, big-endian)
+                val_str = str(int.from_bytes(db_val, 'big')) if db_val else '0'
+            else:
+                val_str = db_val.hex() if db_val else ''
+            result[f"Apple Key: {label}"] = f"{val_str} ({tname})"
+        pos += isz
+    return result
+
+
+def _get_exif_snapshot(path) -> dict:
+    """Run ExifTool on path, return comprehensive metadata for before/after comparison.
+    Merges binary-type annotations for critical Apple Keys from _read_qt_keys_critical."""
+    result = _read_qt_keys_critical(path)
+    if not EXIFTOOL_BIN:
+        return result
     try:
         r = subprocess.run(
             [EXIFTOOL_BIN, "-api", "LargeFileSupport=1",
              "-a", "-u", "-G1", "-j",
-             # Apple QuickTime Keys — explicit list (no Keys:FocalLength noise)
-             "-Keys:Make", "-Keys:Model", "-Keys:Software",
-             "-Keys:CameraLensModel",
-             "-Keys:GPSCoordinates", "-Keys:LocationName",
-             "-Keys:LocationBody", "-Keys:LocationDate",
-             "-Keys:CreationDate", "-Keys:ContentIdentifier",
-             "-Keys:HDRVideoFormat",
-             # Video color metadata (for HDR/DV comparison)
+             # All Apple QuickTime Keys (comprehensive — including proprietary)
+             "-Keys:all",
+             # Video technical
+             "-ImageWidth", "-ImageHeight", "-VideoFrameRate",
+             "-Duration", "-AvgBitrate", "-CompressorID", "-Rotation",
+             # Audio technical
+             "-AudioChannels", "-AudioSampleRate", "-AudioBitsPerSample",
+             # Color/HDR
              "-ColorPrimaries", "-TransferCharacteristics", "-MatrixCoefficients",
              str(path)],
             capture_output=True, text=True, timeout=30
         )
         data = json.loads(r.stdout or "[]")
-        return data[0] if data else {}
+        result.update({k: v for k, v in (data[0] if data else {}).items()
+                       if k != "SourceFile"})
     except Exception:
-        return {}
+        pass
+    return result
 
 
 # ── Dolby Vision: Annex-B parser + timestamp-preserving mux ──────────────────
@@ -329,9 +1239,7 @@ def _annexb_to_mp4_samples(hevc_path: str) -> list:
     for idx, (nal_start, sc_len) in enumerate(sc_pos):
         nal_end = sc_pos[idx + 1][0] - sc_pos[idx + 1][1] if idx + 1 < len(sc_pos) else total
         nal = raw[nal_start:nal_end]
-        # strip trailing emulation-prevention zeros
-        while len(nal) > 1 and nal[-1] == 0:
-            nal = nal[:-1]
+        # nal_end already points to the byte before the next start code
         if nal:
             nals.append(((nal[0] >> 1) & 0x3F, nal))
 
@@ -607,11 +1515,11 @@ def _dovi_mux_with_timestamps(base_mov: str, dv_samples: list, dst: str) -> bool
         tmp_path = dst + '._dv_tmp'
         with open(tmp_path, 'wb') as f:
             f.write(new_buf)
-        import os; os.replace(tmp_path, dst)
+        os.replace(tmp_path, dst)
         return True
     except OSError:
         try:
-            import os; os.unlink(tmp_path)
+            os.unlink(tmp_path)
         except Exception:
             pass
         return False
@@ -786,762 +1694,819 @@ def _unique_output_path(stem: str, ext: str, base_dir: Path = None) -> Path:
     with _output_lock:
         dst = base_dir / f"{stem}{ext}"
         counter = 2
-        while True:
+        while counter < 10000:
             try:
                 dst.touch(exist_ok=False)
                 return dst
             except FileExistsError:
                 dst = base_dir / f"{stem}_{counter}{ext}"
                 counter += 1
+        raise RuntimeError(f"Cannot find unique output path for {stem!r}{ext} after 10000 attempts")
 
-===== FILE: app/static/js/tabs/compress.js =====
-// tabs/compress.js — compress tab logic
+===== FILE: app/static/js/state.js =====
+// state.js — shared mutable state
 
-import { $, sv, fmtSize, parseSize, resLabel, showErr, hideErr, setBusy, codecMap } from '../ui/utils.js';
-import { customConfirm } from '../ui/modals.js';
-import { S, CRF_DEFAULTS, muteAudio, setCrfPreset, setCrfValue } from '../state.js';
+export const S = {
+  compress: {
+    file: null, jobId: null, t0: null,
+    encLabel: '', crf: '24',
+    files: [], jobs: {}, batchId: null, batchStartTime: null,
+    server_file: null,
+  },
+  social: {
+    file: null, jobId: null, t0: null, server_file: null, done: false,
+  },
+  audio: {
+    file: null, jobId: null, t0: null, server_file: null, done: false,
+  },
+  download: {
+    jobId: null, t0: null, done: false, titles: [], out_dir: null,
+  },
+};
 
-const _META_SKIP = new Set(['SourceFile', 'ExifToolVersion', 'FileName', 'Directory',
-                             'FileSize', 'FileModifyDate', 'FileAccessDate', 'FileCreateDate',
-                             'FileInodeChangeDate', 'FilePermissions']);
+export let socialVideoPreset = 'story_vertical';
+export let socialPhotoPreset = 'story';
+export let audioFmt          = 'mp3';
+export let socialFileType    = 'video';
+export let dlType            = 'video';
+export let dlBrowser         = 'none';
+export let crfPreset         = 'auto';
+export let crfValue          = 24;
+export let muteAudio         = false;
+export let preserveDv        = true;
+export let dlMode            = 'single';
 
-export function showCompressResult(data) {
-  const pct = (data.sz_before && data.sz_after)
-    ? Math.round((1 - parseSize(data.sz_after) / parseSize(data.sz_before)) * 100)
-    : (data.reduction || null);
-  const outPath = data.output || '';
-  const outName = outPath.split('\\').pop().split('/').pop() || '—';
-  sv('res-fname',  outName);
-  sv('res-before', data.sz_before   || '—');
-  sv('res-after',  data.sz_after    || '—');
-  sv('res-pct',    pct !== null ? pct + '%' : '—');
-  sv('res-time',   data.encode_time || '—');
-  sv('res-res',    data.out_res     || '—');
-  sv('res-fps',    data.out_fps     || '—');
-  sv('res-audio',  data.out_audio   || '—');
-  sv('res-enc',    S.compress.encLabel || '—');
-  sv('res-crf',    'CRF ' + (S.compress.crf || '—'));
-}
+export function setSocialVideoPreset(v) { socialVideoPreset = v; }
+export function setSocialPhotoPreset(v) { socialPhotoPreset = v; }
+export function setAudioFmt(v)          { audioFmt = v; }
+export function setSocialFileType(v)    { socialFileType = v; }
+export function setDlType_(v)           { dlType = v; }
+export function setDlBrowser(v)         { dlBrowser = v; }
+export function setCrfPreset(v)         { crfPreset = v; }
+export function setCrfValue(v)          { crfValue = v; }
+export function setMuteAudio(v)         { muteAudio = v; }
+export function setPreserveDv(v)        { preserveDv = v; }
+export function setDlMode_(v)           { dlMode = v; }
 
-export function _buildJobResultHTML(jid, file, data, idxStr = '') {
-  const _film = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;color:var(--blue)"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/></svg>`;
-  const _xc   = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
-  const _dl   = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
-  const _log  = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`;
-  const _meta = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2V9M9 21H5a2 2 0 0 1-2-2V9m0 0h18"/></svg>`;
-  const fname = data && data.output ? data.output.split(/[\\/]/).pop() : file;
+export const CRF_DEFAULTS = window.CRF_DEFAULTS;
 
-  if (!data) {
-    return `
-      <div style="display:flex; justify-content:space-between; align-items:center;" class="mob-col">
-        <div style="flex-grow:1; min-width:0; padding-right:15px; display:flex; flex-direction:column; justify-content:center; gap:8px;" class="mob-pr0">
-          <div style="font-size:13px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--red-l);" title="${fname}" class="mob-title">${idxStr}${fname}</div>
-        </div>
-        <div style="flex-shrink:0; color:var(--red); font-size:13px;">${_xc} Error: No data</div>
-      </div>`;
-  }
-  if (data.status === 'done') {
-    const oldB = parseSize(data.sz_before);
-    const newB = parseSize(data.sz_after);
-    let pctHtml = '';
-    if (oldB > 0) {
-      const pct = ((oldB - newB) / oldB) * 100;
-      pctHtml = pct >= 0
-        ? `<span style="color:var(--green-l);font-weight:700;font-size:13px;">↓ ${pct.toFixed(1)}%</span>`
-        : `<span style="color:var(--red-l);font-weight:700;font-size:13px;">↑ +${Math.abs(pct).toFixed(1)}%</span>`;
-    }
-    const displayCodec = codecMap[data.out_codec] || data.out_codec || '?';
-    const jobMeta = S.compress.jobs[jid];
-    const fObj = (jobMeta && jobMeta.fileIdx !== undefined)
-      ? S.compress.files[jobMeta.fileIdx]
-      : S.compress.files.find(f => f.file.name === file);
-    const originalRes = (fObj && fObj.meta && fObj.meta.res) ? fObj.meta.res : (data.out_res !== 'N/A' ? data.out_res : '?');
-    const duration    = (fObj && fObj.meta && fObj.meta.duration) ? fObj.meta.duration : (data.out_duration !== 'N/A' && data.out_duration ? data.out_duration : '?');
-    const _ic_cpu = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>`;
-    const _ic_res = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><path d="M1 6V2h4"/><path d="M1 18v4h4"/><path d="M23 6V2h-4"/><path d="M23 18v4h-4"/></svg>`;
-    const _ic_clk = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
-    const _ic_fps = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`;
-    const _ic_aud = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
-    const _chip = (ic, txt, lbl) => `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px 3px 6px;border-radius:100px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:var(--text-2);white-space:nowrap;" title="${lbl}">${ic} ${txt}</span>`;
-    const dispRes = resLabel(originalRes);
-    return `
-      <div style="display:flex; justify-content:space-between; align-items:center;" class="mob-col">
-        <div style="flex-grow:1; min-width:0; padding-right:15px; display:flex; flex-direction:column; justify-content:center; gap:8px;" class="mob-pr0">
-          <div style="display:flex; align-items:center; gap:6px; min-width:0;">
-            <div style="font-size:13px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--green-l); flex-shrink:1; min-width:0;" title="${fname}" class="mob-title">${idxStr}${fname}</div>
-            <button onclick="window.showMetaCompare('${jid}')" style="flex-shrink:0; padding:2px 8px; font-size:11px; font-weight:600; border-radius:100px; display:inline-flex; align-items:center; gap:4px; background:rgba(var(--green-rgb),0.12); border:1px solid rgba(var(--green-rgb),0.25); color:var(--green-l); cursor:pointer; font-family:inherit; white-space:nowrap;">
-              ${_meta} Metadata
-            </button>
-          </div>
-          ${data.warning ? `<div style="font-size:11px; color:var(--yellow); font-style:italic; margin-top:2px;">${data.warning}</div>` : ''}
-          <div style="display:flex; gap:5px; font-size:12px; align-items:center; flex-wrap:wrap;" class="mob-wrap">
-            ${_chip(_ic_cpu, displayCodec,         'Codec')}
-            ${_chip(_ic_res, dispRes,              'Resolution')}
-            ${_chip(_ic_clk, duration,             'Duration')}
-            ${_chip(_ic_fps, data.out_fps || '?',  'FPS')}
-            ${_chip(_ic_aud, data.out_audio || '?','Audio')}
-          </div>
-        </div>
-        <div style="flex-shrink:0; display:flex; flex-direction:column; align-items:flex-end; gap:5px;" class="mob-row">
-          <div style="white-space:nowrap; text-align:right;">
-            ${data.sz_before ? `<span style="color:var(--text-3);font-size:13px;">${data.sz_before}</span><span style="color:var(--text-3);font-size:13px;margin:0 5px;">→</span>` : ''}
-            <span style="color:var(--text);font-weight:700;font-size:14px;">${data.sz_after}</span>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
-            ${pctHtml}
-            <span style="color:var(--text-3);font-size:13px;font-weight:500;">· ${data.encode_time || '?'}</span>
-          </div>
-          <a href="/api/download_file/${jid}" class="btn" style="width:auto; padding:4px 12px; font-size:12px; font-weight:600; border-radius:var(--radius-sm); display:inline-flex; align-items:center; gap:6px; background:linear-gradient(135deg, var(--green), var(--green-d)); color:#fff; border:none; box-shadow:0 2px 8px rgba(var(--green-rgb),0.3); text-decoration:none">
-            ${_dl} Download
-          </a>
-        </div>
-      </div>`;
-  }
-  return `
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <div style="flex-grow:1; min-width:0; padding-right:15px; display:flex; flex-direction:column; justify-content:center; gap:8px;">
-        <div style="font-size:13px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--red-l);" title="${fname}" class="mob-title">${idxStr}${fname}</div>
+===== FILE: app/templates/index.html =====
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>VideoShrink Web</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header" style="position: relative;">
+    <h1><img src="{{ url_for('static', filename='favicon.svg') }}" style="vertical-align: middle; margin-right: 10px; width: 36px; height: 36px; margin-top: -6px;"><span class="title-grad">VideoShrink</span></h1>
+    <p>Advanced Media Compressor & Downloader</p>
+  </div>
+
+  <div class="conn-box mb12">
+    <div class="conn-header" onclick="toggleConn()">
+      <div class="conn-header-left" style="font-size: 12px; font-weight: 600;">
+        <i data-lucide="globe" style="width:14px;height:14px;transform:translateY(-1px)"></i><span id="conn-title" style="text-transform: uppercase; letter-spacing: 1px;">SYSTEM DASHBOARD</span>
       </div>
-      <div style="flex-shrink:0; color:var(--red); font-size:13px; display:flex; align-items:center; gap:8px;">
-        <span>${_xc} ${data.message || 'Error'}</span>
-        ${data.cancelled ? '' : `<button onclick="viewLog('${jid}')" style="background:var(--red);border:none;color:#fff;border-radius:var(--radius-sm);padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit;font-weight:600;">${_log} View Log</button>`}
-      </div>
-    </div>`;
-}
-
-export function _updateBatchStartBtn() {
-  const btn = $('btn-start-compress');
-  if (!btn) return;
-  const hasReady = S.compress.files && S.compress.files.some(f => f.status === 'ready');
-  btn.disabled = !hasReady;
-}
-
-export function renderBatchList() {
-  const container = $('batch-list-compress');
-  if (!container) return;
-  const _ic_hdd = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></svg>`;
-  const _ic_cpu = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>`;
-  const _ic_res = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><path d="M1 6V2h4"/><path d="M1 18v4h4"/><path d="M23 6V2h-4"/><path d="M23 18v4h-4"/></svg>`;
-  const _ic_clk = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`;
-  const _ic_fps = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`;
-  const _ic_aud = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;vertical-align:-1px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
-  const _chip    = (ic, txt, lbl) => `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px 3px 6px;border-radius:100px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);color:var(--text-2);white-space:nowrap;" title="${lbl}">${ic} ${txt}</span>`;
-  const _chip_sz = (ic, txt, lbl) => `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px 3px 6px;border-radius:100px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:var(--text-1);font-weight:600;white-space:nowrap;" title="${lbl}">${ic} ${txt}</span>`;
-  const _ic_check = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><polyline points="20 6 9 17 4 12"/></svg>`;
-  const _ic_xcSm  = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
-
-  container.innerHTML = S.compress.files.map((f, i) => {
-    let stat = '';
-    if (f.status === 'pending') stat = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:100px;background:rgba(255,255,255,0.05);color:var(--text-3);font-size:11px;font-weight:500;">${_ic_clk} Pending</span>`;
-    if (f.status === 'probing') stat = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:100px;background:rgba(var(--purple-rgb),0.15);color:var(--purple-l);font-size:11px;font-weight:600;">↑ Loading</span>`;
-    if (f.status === 'ready')   stat = `<span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:rgba(var(--green-rgb),0.15);color:var(--green-l);" title="Ready">${_ic_check}</span>`;
-    if (f.status === 'error')   stat = `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:100px;background:rgba(var(--red-rgb),0.15);color:var(--red-l);font-size:11px;font-weight:600;" title="${f.errMsg || ''}">${_ic_xcSm} Error</span>`;
-
-    return `<div style="padding:12px 0; border-bottom:1px solid rgba(255,255,255,0.05); font-size:13px;">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:10px;">
-        <div style="font-weight:500; min-width:0; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--blue);" title="${f.file.name}">
-          <span style="margin-right:4px;">${i + 1}.</span>${f.file.name}
+      <div style="display:flex; align-items:center; gap:8px;">
+        <div id="client-count-container" style="background: rgba(255,255,255,0.05); padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; color: var(--text-2); display:flex; align-items:center; gap:6px;">
+          <i data-lucide="monitor" style="width:14px;height:14px;vertical-align:middle"></i> <span id="dash-client-count">0 Clients</span>
         </div>
-        <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
-          ${_chip_sz(_ic_hdd, fmtSize(f.size), 'Size')}
-          ${stat}
+        <div id="server-status-item" style="background: rgba(255,255,255,0.05); padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; color: var(--text-3); display:flex; align-items:center; gap:6px;">
+          <span id="server-status-dot" class="status-dot" style="background: var(--yellow); box-shadow: 0 0 8px var(--yellow);"></span><span id="server-status-txt" style="color: var(--yellow); text-shadow: 0 0 8px var(--yellow);">CONNECTING</span>
+        </div>
+        <span class="conn-arrow open" id="conn-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+      </div>
+    </div>
+    <div class="conn-body" id="conn-body" style="display:none">
+      <!-- Server mode: truy cập từ localhost -->
+      <div id="conn-server-mode">
+        <div class="conn-row">
+          <span class="conn-icon"><i data-lucide="laptop" style="width:18px;height:18px"></i></span>
+          <span class="conn-label">This PC (Local)</span>
+          <a class="conn-link" href="http://localhost:5000" target="_blank">localhost:5000</a>
+          <button class="conn-copy-btn" onclick="copyUrl('http://localhost:5000',this)">Copy</button>
+        </div>
+        <div class="conn-row">
+          <span class="conn-icon"><i data-lucide="smartphone" style="width:18px;height:18px"></i></span>
+          <span class="conn-label">Other devices</span>
+          <a class="conn-link" href="http://{{ local_ip }}:5000" target="_blank">{{ local_ip }}:5000</a>
+          <button class="conn-copy-btn" onclick="copyUrl('http://{{ local_ip }}:5000',this)">Copy</button>
+        </div>
+        <div class="conn-tip" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 8px 12px; border-radius: var(--radius-sm); margin-top: 8px; margin-bottom: 16px;"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Access from other devices via the same WiFi/LAN</div>
+
+        <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px; margin-top: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 8px; margin-bottom: 8px;">
+            <div style="font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 6px;"><i data-lucide="monitor" style="width:14px;height:14px;transform:translateY(-1px)"></i> ACTIVE CLIENTS</div>
+            <div style="font-size: 12px; font-weight: 500; color: var(--text-2);" id="dash-client-count-2">0 Clients</div>
+          </div>
+          <div id="dash-client-list" style="display: flex; flex-direction: column; gap: 8px;">
+            <div style="color:var(--text-3); text-align:center; padding:10px 0; font-size: 10px;">No external clients connected</div>
+          </div>
         </div>
       </div>
-      ${f.meta ? `<div style="display:flex; gap:5px; font-size:12px; align-items:center; flex-wrap:wrap;">
-        ${_chip(_ic_cpu, f.meta.codec || '?',                     'Codec')}
-        ${_chip(_ic_res, resLabel(f.meta.res || '?'),             'Resolution')}
-        ${_chip(_ic_clk, f.meta.duration || '?',                  'Duration')}
-        ${_chip(_ic_fps, f.meta.fps ? f.meta.fps + ' fps' : '?', 'FPS')}
-        ${_chip(_ic_aud, f.meta.audio || '?',                     'Audio')}
-        ${f.meta.is_dolby_vision ? `<span style="display:inline-flex;align-items:center;padding:3px 8px;border-radius:100px;background:rgba(var(--purple-rgb),0.15);border:1px solid rgba(var(--purple-rgb),0.3);color:var(--purple-l);font-size:11px;font-weight:700;white-space:nowrap;">DV P${f.meta.dv_profile}</span>` : ''}
-        ${f.meta.is_dual_camera ? `<span style="display:inline-flex;align-items:center;padding:3px 8px;border-radius:100px;background:rgba(var(--blue-rgb),0.12);border:1px solid rgba(var(--blue-rgb),0.25);color:var(--blue);font-size:11px;font-weight:700;white-space:nowrap;">Dual Cam</span>` : ''}
-        ${f.meta.is_action_mode ? `<span style="display:inline-flex;align-items:center;padding:3px 8px;border-radius:100px;background:rgba(var(--yellow-rgb),0.12);border:1px solid rgba(var(--yellow-rgb),0.3);color:var(--yellow);font-size:11px;font-weight:700;white-space:nowrap;">Action</span>` : ''}
-      </div>` : ''}
-    </div>`;
-  }).join('');
-}
-
-export async function probeBatchFile(index) {
-  const fObj = S.compress.files[index];
-  fObj.status = 'probing';
-  renderBatchList();
-
-  const loadEl = $('vinfo-loading-compress');
-  loadEl.classList.remove('hidden');
-  loadEl.textContent = `Uploading file ${index+1}/${S.compress.files.length} (0%)...`;
-
-  return new Promise((resolve) => {
-    const fd = new FormData();
-    fd.append('file', fObj.file);
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/probe', true);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        if (pct < 100) loadEl.textContent = `Uploading file ${index+1} (${pct}%)...`;
-        else loadEl.textContent = `Reading metadata for file ${index+1}...`;
-      }
-    };
-    xhr.onload = () => {
-      if (xhr.status === 200) {
-        try {
-          const data = JSON.parse(xhr.responseText);
-          if (data.server_file) {
-            fObj.server_file = data.server_file;
-            fObj.status = 'ready';
-            fObj.meta = data;
-          } else {
-            fObj.status = 'error';
-            fObj.errMsg = data.error || 'No server_file';
-          }
-        } catch(e) {
-          fObj.status = 'error';
-          fObj.errMsg = 'JSON Parse Error';
-        }
-      } else {
-        fObj.status = 'error';
-        try {
-          const errData = JSON.parse(xhr.responseText);
-          fObj.errMsg = errData.error || `HTTP ${xhr.status}`;
-        } catch(e) {
-          fObj.errMsg = `HTTP ${xhr.status}: ${xhr.statusText}`;
-        }
-      }
-      loadEl.classList.add('hidden');
-      renderBatchList();
-      _updateBatchStartBtn();
-      resolve();
-    };
-    xhr.onerror = () => {
-      fObj.status = 'error';
-      fObj.errMsg = 'Network disconnected';
-      loadEl.classList.add('hidden');
-      renderBatchList();
-      _updateBatchStartBtn();
-      resolve();
-    };
-    xhr.send(fd);
-  });
-}
-
-export async function cancelSingleJob(jid, uid) {
-  if (!(await customConfirm('Are you sure you want to cancel this video compression?'))) return;
-  try {
-    const cBtn = $('btn-cancel-' + uid);
-    if (cBtn) cBtn.style.display = 'none';
-    await fetch('/api/cancel/' + jid, { method: 'POST' });
-  } catch(e) {}
-}
-
-export async function startCompress() {
-  if (!S.compress.files || S.compress.files.length === 0) {
-    showErr('compress', 'Please select video(s)!'); return;
-  }
-
-  const readyFiles = S.compress.files.filter(f => f.status === 'ready');
-  if (readyFiles.length === 0) {
-    showErr('compress', 'No files are ready or currently uploading!'); return;
-  }
-
-  $('err-compress').textContent = '';
-  $('err-compress').classList.remove('show');
-
-  S.compress.encLabel = $('cs-encoder-val').textContent;
-  S.compress.crf      = $('crf-value').value;
-
-  setBusy('compress', true);
-
-  const enc = $('enc-compress').value;
-  const fmt = $('fmt-compress').value;
-  const crf = $('crf-value').value;
-
-  S.compress.jobs = {};
-  S.compress.batchStartTime = Date.now();
-  const timerEl = $('batch-elapsed-timer');
-  if (timerEl) timerEl.textContent = '00:00';
-
-  const progCard = $('prog-compress');
-  progCard.classList.remove('hidden');
-  progCard.style.background = `linear-gradient(180deg, rgba(var(--purple-rgb), 0.18) 0%, rgba(var(--purple-rgb), 0.00) 100%)`;
-  progCard.style.border     = `1px solid rgba(var(--purple-rgb), 0.35)`;
-  progCard.style.boxShadow  = `0 16px 40px rgba(0, 0, 0, 0.45)`;
-  $('res-compress').classList.add('hidden');
-  $('btn-area-compress').classList.add('hidden');
-
-  const btnChange = $('btn-change-compress');
-  if (btnChange) btnChange.style.display = 'none';
-
-  const progCountEl = $('batch-progress-count');
-  if (progCountEl) progCountEl.textContent = `(0/${readyFiles.length} videos)`;
-
-  const pList = $('batch-progress-list');
-  pList.innerHTML = '';
-
-  pList.innerHTML = readyFiles.map((f, i) => {
-    const id = 'prog-item-' + i;
-    return `
-      <div id="${id}" style="padding:12px 0; border-bottom:1px solid rgba(255,255,255,0.05); background:transparent; position:relative;">
-        <div style="font-size:13px; margin-bottom:6px; font-weight:500; padding-right:25px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--purple-l);" class="mob-title">
-          <span style="margin-right:4px;">${i+1}.</span>${f.file.name}
+      <!-- Client mode: truy cập từ điện thoại / PC khác qua IP -->
+      <div id="conn-client-mode" class="hidden">
+        <div class="conn-row">
+          <span class="conn-icon"><i data-lucide="radio" style="width:18px;height:18px"></i></span>
+          <span class="conn-label">Server</span>
+          <a class="conn-link" id="conn-client-link" href="#" target="_blank">—</a>
+          <button class="conn-copy-btn" onclick="copyUrl($('conn-client-link').href,this)">Copy</button>
         </div>
-        <button id="btn-cancel-${id}" style="position:absolute;top:10px;right:10px;background:none;border:none;cursor:pointer;opacity:0.7;display:none;color:var(--text-3);padding:0;line-height:1" title="Cancel this process"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-        <div style="font-size:12px; color:var(--text-3); margin-bottom:4px;" id="msg-${id}">Initializing...</div>
-        <div class="prog-track"><div class="prog-fill" id="bar-${id}"></div></div>
-        <div class="prog-meta" style="margin-top:4px"><span id="pct-${id}">0%</span><span id="eta-${id}"></span></div>
+        <div class="conn-tip"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Connected via Local Area Network (LAN)</div>
       </div>
-    `;
-  }).join('');
+    </div>
+  </div>
 
-  const clientBatchId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
-  for (let i = 0; i < readyFiles.length; i++) {
-    const fObj = readyFiles[i];
-    const id   = 'prog-item-' + i;
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('compress',this)"><i data-lucide="minimize" class="tab-icon"></i> Compress</button>
+    <button class="tab"        onclick="switchTab('social',this)"><i data-lucide="smartphone" class="tab-icon"></i> Social</button>
+    <button class="tab"        onclick="switchTab('audio',this)"><i data-lucide="music" class="tab-icon"></i> Audio</button>
+    <button class="tab"        onclick="switchTab('download',this)"><i data-lucide="download-cloud" class="tab-icon"></i> Download</button>
+  </div>
 
-    const fd = new FormData();
-    fd.append('client_batch_id', clientBatchId);
-    fd.append('server_file', fObj.server_file);
-    fd.append('original_name', fObj.file.name);
-    fd.append('encoder', enc);
-    fd.append('format', fmt);
-    fd.append('crf', crf);
-    if (muteAudio) fd.append('mute', '1');
+  <!-- ════════════════ NÉN VIDEO ════════════════ -->
+  <div class="panel active" id="tab-compress">
 
-    const ui_meta = fObj.meta ? {
-      codec: fObj.meta.codec, res: fObj.meta.res, duration: fObj.meta.duration,
-      fps: fObj.meta.fps, audio: fObj.meta.audio, size: fObj.size
-    } : {};
-    fd.append('ui_meta', JSON.stringify(ui_meta));
+    <div class="card">
+      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Video files</div>
+      <div class="drop" id="drop-compress">
+        <input type="file" multiple
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'compress')">
+        <span class="drop-icon"><i data-lucide="upload-cloud" style="width:48px;height:48px;stroke-width:1.5"></i></span>
+        <div class="drop-txt">Click or drag & drop video here</div>
+        <div class="drop-sub">MP4 · MOV · MKV · AVI · WebM</div>
+      </div>
+      <div class="vinfo" id="vinfo-compress">
+        <input type="file" id="repick-compress" style="display:none" multiple
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'compress')">
+        <div class="vinfo-name">
+          <span class="vn-icon"><i data-lucide="film" style="width:16px;height:16px"></i></span>
+          <span class="vn-text" id="vn-name-compress">Selected video</span>
+          <button id="btn-change-compress" class="vn-btn" onclick="document.getElementById('repick-compress').click()">Change</button>
+        </div>
+        <div class="vinfo-loading hidden" id="vinfo-loading-compress"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
+        <div id="batch-list-compress" class="dark-scroll" style="margin-top: 10px; max-height: 250px; overflow-y: auto; padding-right: 5px;">
+          <!-- Danh sách file sẽ render vào đây -->
+        </div>
+      </div>
+    </div>
 
-    try {
-      const res  = await fetch('/api/compress', { method: 'POST', body: fd });
-      const data = await res.json();
-      const fileIdx = S.compress.files.indexOf(fObj);
-      if (res.ok && data.job_id) {
-        S.compress.jobs[data.job_id] = { ui_id: id, file: fObj.file.name, fileIdx, done: false };
-        const cBtn = $('btn-cancel-' + id);
-        if (cBtn) {
-          cBtn.style.display = 'block';
-          cBtn.onclick = () => cancelSingleJob(data.job_id, id);
-        }
-      } else {
-        S.compress.jobs[id] = { ui_id: id, file: fObj.file.name, fileIdx, done: true, result: { status: 'error', message: data.error || 'Rejected' } };
-        const progItem = $(id);
-        if (progItem) {
-          progItem.innerHTML = _buildJobResultHTML(id, fObj.file.name, S.compress.jobs[id].result, `<span style="margin-right:4px;">${i + 1}.</span>`);
-        }
-      }
-    } catch(e) {
-      sv('msg-' + id, 'Connection error');
-    }
-  }
-
-  if (S.compress.timer) clearInterval(S.compress.timer);
-  S.compress.timer = setInterval(pollBatchProgress, 1000);
-}
-
-let _batchPollBusy = false;
-
-export async function pollBatchProgress() {
-  if (_batchPollBusy) return;
-  _batchPollBusy = true;
-  try { await _doPollBatchProgress(); } finally { _batchPollBusy = false; }
-}
-
-async function _doPollBatchProgress() {
-  const allJobIds    = Object.keys(S.compress.jobs);
-  const activeJobIds = allJobIds.filter(jid => !S.compress.jobs[jid].done);
-  const doneCount    = allJobIds.length - activeJobIds.length;
-
-  const progCountEl = $('batch-progress-count');
-  if (progCountEl && allJobIds.length > 0) {
-    progCountEl.textContent = `(${doneCount}/${allJobIds.length} videos)`;
-  }
-
-  if (activeJobIds.length === 0) {
-    clearInterval(S.compress.timer);
-    S.compress.timer = null;
-    setBusy('compress', false);
-    const timerEl = $('batch-elapsed-timer');
-    if (timerEl && S.compress.batchStartTime) {
-      const totalSec = Math.round((Date.now() - S.compress.batchStartTime) / 1000);
-      const m = Math.floor(totalSec / 60), s = totalSec % 60;
-      timerEl.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    }
-    renderBatchResult();
-    return;
-  }
-
-  const _timerEl = $('batch-elapsed-timer');
-  if (_timerEl && S.compress.batchStartTime) {
-    const _elapsed = Math.round((Date.now() - S.compress.batchStartTime) / 1000);
-    const _m = Math.floor(_elapsed / 60), _s = _elapsed % 60;
-    _timerEl.textContent = `${String(_m).padStart(2,'0')}:${String(_s).padStart(2,'0')}`;
-  }
-
-  const _abortCtrl = new AbortController();
-  const _abortTid  = setTimeout(() => _abortCtrl.abort(), 3000);
-  try {
-    const res = await fetch('/api/status_batch', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ job_ids: activeJobIds }),
-      signal: _abortCtrl.signal
-    });
-    clearTimeout(_abortTid);
-    if (!res.ok) return;
-    const batchData = await res.json();
-
-    activeJobIds.forEach(jid => {
-      const data    = batchData[jid];
-      if (!data) return;
-      const jobMeta = S.compress.jobs[jid];
-      const uid     = jobMeta.ui_id;
-      const pct     = data.progress || 0;
-
-      const elPct = $('pct-' + uid);
-      const elMsg = $('msg-' + uid);
-      const elBar = $('bar-' + uid);
-      const elEta = $('eta-' + uid);
-
-      if (elPct) elPct.innerText = pct + '%';
-      if (elMsg) elMsg.innerText = data.message || 'Processing...';
-      if (elBar) elBar.style.width = pct + '%';
-
-      if (pct > 0 && pct < 100) {
-        if (!jobMeta.t0) jobMeta.t0 = Date.now() / 1000;
-        const ela = (Date.now() / 1000) - jobMeta.t0;
-        const eta = Math.round((ela / pct) * (100 - pct));
-        if (elEta) elEta.innerText = eta > 0 ? '~' + eta + 's left' : '';
-      } else {
-        if (elEta) elEta.innerText = '';
-      }
-
-      if (data.status === 'done' || data.status === 'error') {
-        jobMeta.done   = true;
-        jobMeta.result = data;
-        const btnCancel = $('btn-cancel-' + uid);
-        if (btnCancel) btnCancel.style.display = 'none';
-        const progItem = $(uid);
-        if (progItem) {
-          progItem.style.background   = 'transparent';
-          progItem.style.padding      = '12px 0';
-          progItem.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
-          const idx    = jobMeta.fileIdx !== undefined ? jobMeta.fileIdx
-                       : S.compress.files ? S.compress.files.findIndex(f => f.file.name === jobMeta.file) : -1;
-          const idxStr = idx >= 0 ? `<span style="margin-right:4px;">${idx + 1}.</span>` : '';
-          progItem.innerHTML = _buildJobResultHTML(jid, jobMeta.file, data, idxStr);
-        }
-      }
-    });
-  } catch(e) {
-    clearTimeout(_abortTid);
-    if (e.name !== 'AbortError') console.error('Batch polling error:', e);
-  }
-}
-
-export function renderBatchResult() {
-  $('prog-compress').classList.add('hidden');
-  $('res-compress').classList.remove('hidden');
-
-  const jobCount  = Object.keys(S.compress.jobs).length;
-  const doneCount = Object.values(S.compress.jobs).filter(j => j.result && j.result.status === 'done').length;
-  const errCount  = jobCount - doneCount;
-
-  let theme = 'green', themeL = 'green-l';
-  let titleHtml = `<i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> All tasks completed!`;
-
-  if (doneCount === 0 && errCount > 0) {
-    theme = 'red'; themeL = 'red-l';
-    titleHtml = `<i data-lucide="x-circle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> Batch failed!`;
-  } else if (errCount > 0) {
-    theme = 'yellow'; themeL = 'yellow-l';
-    titleHtml = `<i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--yellow)"></i> Batch finished with errors`;
-  }
-
-  const badge = $('res-compress').querySelector('.res-badge');
-  badge.innerHTML  = titleHtml;
-  badge.style.fontSize   = '20px';
-  badge.style.color      = `var(--${themeL})`;
-  badge.style.textShadow = `0 0 12px rgba(var(--${theme}-rgb), 0.4)`;
-
-  const resBox = $('res-compress').querySelector('.result-box');
-  resBox.style.background = `linear-gradient(180deg, rgba(var(--${theme}-rgb), 0.18) 0%, rgba(var(--${theme}-rgb), 0.00) 100%)`;
-  resBox.style.border     = `1px solid rgba(var(--${theme}-rgb), 0.35)`;
-  resBox.style.boxShadow  = `0 16px 40px rgba(0, 0, 0, 0.45)`;
-
-  let totalTimeHtml = '';
-  if (S.compress.batchStartTime) {
-    const totalMs  = Date.now() - S.compress.batchStartTime;
-    const totalSec = Math.round(totalMs / 1000);
-    const mins     = Math.floor(totalSec / 60), secs = totalSec % 60;
-    const timeStr  = mins > 0 ? `${mins}m ${secs}s` : `${totalSec}s`;
-    totalTimeHtml  = `
-      <div style="margin-top:10px; padding:10px 14px; background:rgba(var(--${theme}-rgb),0.06); border:1px solid rgba(var(--${theme}-rgb),0.2); border-radius:var(--radius-sm); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-        <span style="font-size:12px; color:var(--text-2); display:flex; align-items:center; gap:6px;">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;color:var(--${theme})"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          Total processing time for ${jobCount} files
-        </span>
-        <span style="font-size:14px; font-weight:700; color:var(--${theme});">${timeStr}</span>
-      </div>`;
-  }
-
-  let totalEl = $('batch-total-time');
-  if (!totalEl) {
-    totalEl = document.createElement('div');
-    totalEl.id = 'batch-total-time';
-    badge.insertAdjacentElement('afterend', totalEl);
-  }
-  totalEl.innerHTML = totalTimeHtml;
-  if (window.lucide) lucide.createIcons();
-
-  const itemStyle = 'padding:12px 0; border-bottom:1px solid rgba(255,255,255,0.05); font-size:13px;';
-  $('batch-result-list').innerHTML = (S.compress.files || [])
-    .map((f, idx) => {
-      const jobEntry = Object.entries(S.compress.jobs).find(([k, v]) => v.fileIdx === idx);
-      if (!jobEntry) return '';
-      const [jid, job] = jobEntry;
-      const idxStr = `<span style="margin-right:4px;">${idx + 1}.</span>`;
-      return `<div style="${itemStyle}">${_buildJobResultHTML(jid, job.file, job.result, idxStr)}</div>`;
-    })
-    .join('');
-}
-
-export function clearAllDoneJobs() {
-  const pList = $('batch-progress-list');
-  if (pList) pList.innerHTML = '';
-  const drop = $('drop-compress'); if (drop) drop.style.display = 'flex';
-  const vinfo = $('vinfo-compress'); if (vinfo) vinfo.style.display = 'none';
-  $('prog-compress').classList.add('hidden');
-  $('res-compress').classList.add('hidden');
-  $('btn-area-compress').classList.remove('hidden');
-  const btnChange = $('btn-change-compress'); if (btnChange) btnChange.style.display = 'inline-block';
-  const bList = $('batch-list-compress');
-  if (bList) bList.innerHTML = '';
-  S.compress.files = [];
-  S.compress.jobs  = {};
-  setBusy('compress', false);
-}
-
-let _metaCompareAbort = null;
-
-async function showMetaCompare(jobId) {
-  const modal = $('meta-compare-modal');
-  const body  = $('meta-compare-body');
-  if (!modal || !body) return;
-
-  // Cancel any in-flight request (double-click / rapid open guard)
-  if (_metaCompareAbort) { _metaCompareAbort.abort(); }
-  _metaCompareAbort = new AbortController();
-  const _signal = _metaCompareAbort.signal;
-
-  body.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text-3);">Loading...</div>';
-  modal.style.display = 'flex';
-
-  try {
-    const res = await fetch('/api/status/' + jobId, { signal: _signal });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-
-    const src = data.src_exif || {};
-    const dst = data.dst_exif || {};
-
-    if (!Object.keys(src).length && !Object.keys(dst).length) {
-      body.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text-3);">No metadata available.</div>';
-      return;
-    }
-
-    const allKeys = [...new Set([...Object.keys(src), ...Object.keys(dst)])]
-      .filter(k => !_META_SKIP.has(k)).sort();
-
-    const changed = [], unchanged = [];
-    for (const key of allKeys) {
-      const sv = src[key] !== undefined ? String(src[key]) : undefined;
-      const dv = dst[key] !== undefined ? String(dst[key]) : undefined;
-      let cls = '';
-      if (sv !== undefined && dv === undefined) cls = 'missing';
-      else if (sv === undefined && dv !== undefined) cls = 'added';
-      else if (sv !== dv) cls = 'changed';
-      (cls ? changed : unchanged).push({ key, sv, dv, cls });
-    }
-
-    const clrMap  = { missing: 'var(--red-l)', changed: 'var(--yellow)', added: 'var(--green-l)', '': 'var(--text-2)' };
-    const iconMap = { missing: '🔴', changed: '🟡', added: '🟢', '': '✓' };
-
-    const rowHtml = (row) => {
-      const clr    = clrMap[row.cls];
-      const dstClr = row.cls === 'missing' ? 'var(--red-l)' : row.cls === 'changed' ? 'var(--yellow)' : 'var(--text-2)';
-      const srcTxt = row.sv !== undefined ? row.sv : '<em style="color:var(--text-3)">—</em>';
-      const dstTxt = row.dv !== undefined ? row.dv : '<em style="color:var(--text-3)">—</em>';
-      return `<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-        <td style="padding:6px 10px;color:${clr};font-size:12px;white-space:nowrap;vertical-align:top;">${iconMap[row.cls]} ${row.key}</td>
-        <td style="padding:6px 10px;font-size:12px;color:var(--text-2);word-break:break-all;max-width:220px;vertical-align:top;">${srcTxt}</td>
-        <td style="padding:6px 10px;font-size:12px;color:${dstClr};word-break:break-all;max-width:220px;vertical-align:top;">${dstTxt}</td>
-      </tr>`;
-    };
-
-    const tblHead = `<thead><tr style="background:rgba(255,255,255,0.04);">
-      <th style="padding:8px 10px;text-align:left;font-size:11px;color:var(--text-3);font-weight:600;white-space:nowrap;">Field</th>
-      <th style="padding:8px 10px;text-align:left;font-size:11px;color:var(--text-3);font-weight:600;">Before</th>
-      <th style="padding:8px 10px;text-align:left;font-size:11px;color:var(--text-3);font-weight:600;">After</th>
-    </tr></thead>`;
-
-    // DV status banner — pinned at top, only when source had DV
-    let dvHtml = '';
-    if (data.src_is_dv) {
-      const dvPreserved = data.dst_is_dv;
-      const dvClr  = dvPreserved ? 'var(--green-l)' : 'var(--red-l)';
-      const dvBg   = dvPreserved ? 'rgba(var(--green-rgb),0.08)' : 'rgba(var(--red-rgb),0.08)';
-      const dvBdr  = dvPreserved ? 'rgba(var(--green-rgb),0.2)'  : 'rgba(var(--red-rgb),0.2)';
-      const dvIcon = dvPreserved ? '✅' : '❌';
-      const dvMsg  = dvPreserved
-        ? `Dolby Vision Profile ${data.src_dv_profile} — preserved`
-        : `Dolby Vision Profile ${data.src_dv_profile} — downgraded to HDR10 (dovi_tool not used)`;
-      dvHtml = `<div style="padding:10px 14px;background:${dvBg};border-bottom:1px solid ${dvBdr};display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:${dvClr};">${dvIcon} ${dvMsg}</div>`;
-    }
-
-    let html = dvHtml;
-    if (changed.length) {
-      html += `<div style="font-size:11px;font-weight:600;color:var(--text-3);padding:10px 10px 4px;text-transform:uppercase;letter-spacing:0.5px;">Changes (${changed.length})</div>`;
-      html += `<table style="width:100%;border-collapse:collapse;">${tblHead}<tbody>${changed.map(rowHtml).join('')}</tbody></table>`;
-    }
-    if (unchanged.length) {
-      html += `<details style="margin-top:8px;"><summary style="cursor:pointer;font-size:11px;font-weight:600;color:var(--text-3);padding:8px 10px;text-transform:uppercase;letter-spacing:0.5px;user-select:none;">Unchanged (${unchanged.length})</summary>`;
-      html += `<table style="width:100%;border-collapse:collapse;">${tblHead}<tbody>${unchanged.map(rowHtml).join('')}</tbody></table></details>`;
-    }
-    if (!changed.length && !unchanged.length) {
-      html = '<div style="text-align:center;padding:30px;color:var(--text-3);">No metadata fields to compare.</div>';
-    }
-    body.innerHTML = html;
-  } catch(e) {
-    if (e.name === 'AbortError') return;   // user opened another job, silently discard
-    body.innerHTML = `<div style="color:var(--red);padding:20px;">Failed to load: ${e.message}</div>`;
-  }
-}
-window.showMetaCompare = showMetaCompare;
-
-export async function restoreActiveBatch() {
-  try {
-    const res = await fetch('/api/active_compress_batch');
-    if (!res.ok) return;
-    const data = await res.json();
-
-    if (data.active && data.jobs && Object.keys(data.jobs).length > 0) {
-      const jids = Object.keys(data.jobs);
-      const drop = $('drop-compress'); if (drop) drop.style.display = 'none';
-      const vinfo = $('vinfo-compress'); if (vinfo) vinfo.style.display = 'block';
-      sv('vn-name-compress', 'Selected ' + jids.length + ' videos');
-      const btnChange = $('btn-change-compress'); if (btnChange) btnChange.style.display = 'none';
-      $('btn-area-compress').classList.add('hidden');
-
-      const progCard = $('prog-compress');
-      progCard.classList.remove('hidden');
-      progCard.style.background = `linear-gradient(180deg, rgba(var(--purple-rgb), 0.18) 0%, rgba(var(--purple-rgb), 0.00) 100%)`;
-      progCard.style.border     = `1px solid rgba(var(--purple-rgb), 0.35)`;
-      progCard.style.boxShadow  = `0 16px 40px rgba(0, 0, 0, 0.45)`;
-      $('res-compress').classList.add('hidden');
-      setBusy('compress', true);
-
-      if (data.settings) {
-        if (data.settings.encoder) {
-          const opt = document.querySelector(`#cs-encoder .cs-option[data-value="${data.settings.encoder}"]`);
-          if (opt) {
-            $('enc-compress').value = data.settings.encoder;
-            $('cs-encoder-val').innerHTML = opt.innerHTML;
-            document.querySelectorAll('#cs-encoder .cs-option').forEach(el => el.classList.remove('selected'));
-            opt.classList.add('selected');
-          }
-        }
-        if (data.settings.format) {
-          const opt = document.querySelector(`#cs-format .cs-option[data-value="${data.settings.format}"]`);
-          if (opt) {
-            $('fmt-compress').value = data.settings.format;
-            $('cs-format-val').innerHTML = opt.innerHTML;
-            document.querySelectorAll('#cs-format .cs-option').forEach(el => el.classList.remove('selected'));
-            opt.classList.add('selected');
-          }
-        }
-        if (data.settings.crf !== undefined) {
-          const cVal = data.settings.crf;
-          $('crf-value').value = cVal;
-          $('crf-slider').value = cVal;
-          const d = $('crf-display'); if (d) d.textContent = cVal;
-        }
-        if (data.settings.mute !== undefined) {
-          // setMute imported from main
-          window.setMute && window.setMute(data.settings.mute);
-        }
-      }
-
-      S.compress.files = [];
-      S.compress.jobs  = {};
-      const pList = $('batch-progress-list');
-
-      jids.forEach((jid, i) => {
-        const job = data.jobs[jid];
-        const id  = 'prog-item-' + i;
-        S.compress.files.push({
-          id: i, file: { name: job.src_name },
-          size: job.ui_meta && job.ui_meta.size ? job.ui_meta.size : (job.src_size || 0),
-          meta: job.ui_meta || {}, server_file: null, status: 'ready'
-        });
-        S.compress.jobs[jid] = { ui_id: id, file: job.src_name, fileIdx: i, done: job.status === 'done' || job.status === 'error' };
-      });
-
-      renderBatchList();
-
-      pList.innerHTML = jids.map((jid, i) => {
-        const job = data.jobs[jid];
-        const id  = 'prog-item-' + i;
-        return `
-          <div id="${id}" style="padding:12px 0; border-bottom:1px solid rgba(255,255,255,0.05); background:transparent; position:relative;">
-            <div style="font-size:13px; margin-bottom:6px; font-weight:500; padding-right:25px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--purple-l);" class="mob-title">
-              <span style="margin-right:4px;">${i+1}.</span>${job.src_name}
+    <div class="card" id="card-settings-compress">
+      <div class="card-title"><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i> Encoding Settings</div>
+      <div class="row2 mb12">
+        <div>
+          <label>Encoder</label>
+          <div class="cs-wrap" id="cs-encoder">
+            <div class="cs-trigger" onclick="toggleCS('cs-encoder')">
+              <span class="cs-val" id="cs-encoder-val">Loading...</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
             </div>
-            <button id="btn-cancel-${id}" style="position:absolute;top:10px;right:10px;background:none;border:none;cursor:pointer;opacity:0.7;display:none;color:var(--text-3);padding:0;line-height:1" title="Cancel this process"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-            <div style="font-size:12px; color:var(--text-3); margin-bottom:4px;" id="msg-${id}">Restoring...</div>
-            <div class="prog-track"><div class="prog-fill" id="bar-${id}"></div></div>
-            <div class="prog-meta" style="margin-top:4px"><span id="pct-${id}">0%</span><span id="eta-${id}"></span></div>
+            <div class="cs-dropdown">
+              {% for group in encoder_groups %}
+              <div class="cs-group {{ 'warn' if group.warning else '' }}">{{ group.group|safe }}</div>
+              {% for enc in group.encoders %}
+              <div class="cs-option {{ 'selected' if default_enc == enc.codec else '' }}"
+                   data-value="{{ enc.codec }}"
+                   onclick="pickEncoder('{{ enc.codec }}', this.innerHTML)">
+                {{ enc.label|safe }}
+              </div>
+              {% endfor %}
+              {% endfor %}
+            </div>
           </div>
-        `;
-      }).join('');
+          <input type="hidden" id="enc-compress" value="{{ default_enc }}">
+        </div>
+        <div>
+          <label>Format output</label>
+          <div class="cs-wrap" id="cs-format">
+            <div class="cs-trigger" onclick="toggleCS('cs-format')">
+              <span class="cs-val" id="cs-format-val"><i data-lucide="lock" style="width:14px;height:14px;vertical-align:-2px"></i> Keep original</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              <div class="cs-option selected" data-value="original" onclick="pickFormat('original', this.innerHTML)"><i data-lucide="lock" style="width:14px;height:14px;vertical-align:-2px"></i> Keep original</div>
+              <div class="cs-option" data-value=".mp4" onclick="pickFormat('.mp4', this.innerHTML)">MP4 — Best compatibility</div>
+              <div class="cs-option" data-value=".mov" onclick="pickFormat('.mov', this.innerHTML)">MOV — Apple standard</div>
+              <div class="cs-option" data-value=".mkv" onclick="pickFormat('.mkv', this.innerHTML)">MKV — Flexible</div>
+            </div>
+          </div>
+          <input type="hidden" id="fmt-compress" value="original">
+        </div>
+      </div>
 
-      let minCreate = Date.now();
-      let hasCreate = false;
-      const serverTime = data.server_time ? data.server_time * 1000 : Date.now();
+      <!-- Advanced toggle -->
+      <div class="adv-toggle" id="adv-toggle-compress"
+           onclick="toggleAdv('adv-compress','adv-arrow-compress','adv-toggle-compress')">
+        <div class="adv-toggle-left"><span><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i></span><span>Advanced Settings</span></div>
+        <span class="adv-arrow" id="adv-arrow-compress"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+      </div>
+      <div class="adv-body" id="adv-compress">
 
-      jids.forEach((jid, i) => {
-        const id   = 'prog-item-' + i;
-        const cBtn = $('btn-cancel-' + id);
-        if (cBtn && S.compress.jobs[jid].done === false) {
-          cBtn.style.display = 'block';
-          cBtn.onclick = () => cancelSingleJob(jid, id);
-        }
-        if (data.jobs[jid].created_at) {
-          const elapsedOnServer = serverTime - (data.jobs[jid].created_at * 1000);
-          const t = Date.now() - elapsedOnServer;
-          if (t < minCreate) { minCreate = t; hasCreate = true; }
-        }
-      });
-      if (hasCreate) S.compress.batchStartTime = minCreate;
+        <!-- CRF -->
+        <label style="margin-bottom:8px">Compression Quality (CRF)</label>
+        <div class="crf-presets">
+          <button class="crf-btn active" data-preset="auto" onclick="setCRFPreset('auto')">
+            <span class="crf-emoji"><i data-lucide="sparkles"></i></span>
+            <span class="crf-name">Auto</span>
+            <span class="crf-val">Per file</span>
+          </button>
+          <button class="crf-btn" data-preset="high" onclick="setCRFPreset('high')">
+            <span class="crf-emoji"><i data-lucide="trophy"></i></span>
+            <span class="crf-name">Highest</span>
+            <span class="crf-val" id="crf-lbl-high">CRF 24</span>
+          </button>
+          <button class="crf-btn" data-preset="mid" onclick="setCRFPreset('mid')">
+            <span class="crf-emoji"><i data-lucide="scale"></i></span>
+            <span class="crf-name">Balanced</span>
+            <span class="crf-val" id="crf-lbl-mid">CRF 28</span>
+          </button>
+          <button class="crf-btn" data-preset="low" onclick="setCRFPreset('low')">
+            <span class="crf-emoji"><i data-lucide="save"></i></span>
+            <span class="crf-name">Smallest</span>
+            <span class="crf-val" id="crf-lbl-low">CRF 32</span>
+          </button>
+          <button class="crf-btn" data-preset="custom" onclick="setCRFPreset('custom')">
+            <span class="crf-emoji"><i data-lucide="sliders"></i></span>
+            <span class="crf-name">Custom</span>
+            <span class="crf-val">Custom</span>
+          </button>
+        </div>
+        <div class="crf-custom-row" id="crf-custom-row">
+          <span class="crf-range-lbl">0</span>
+          <input type="range" id="crf-slider" min="0" max="51" value="24"
+                 oninput="onCRFSlider(this.value)">
+          <span class="crf-custom-val" id="crf-display">24</span>
+          <span class="crf-range-lbl" id="crf-max-lbl">51</span>
+        </div>
+        <div class="crf-hint" id="crf-hint">lower = better quality · higher = smaller file</div>
 
-      if (S.compress.timer) clearInterval(S.compress.timer);
-      S.compress.timer = setInterval(pollBatchProgress, 1000);
-      pollBatchProgress();
-    }
-  } catch(e) {
-    console.error('Failed to restore batch:', e);
-  }
-}
+        <!-- Mute audio -->
+        <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.06)">
+          <label style="margin-bottom:8px"><i data-lucide="volume-2" style="width:18px;height:18px;vertical-align:-2px"></i> Audio</label>
+          <div class="preset-grid">
+            <div class="preset-btn active" id="mute-btn-keep" onclick="setMute(false)">
+              <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+              <span class="pi"><i data-lucide="volume-2"></i></span>
+              <div class="pn">Keep audio</div>
+            </div>
+            <div class="preset-btn" id="mute-btn-mute" onclick="setMute(true)">
+              <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+              <span class="pi"><i data-lucide="volume-x"></i></span>
+              <div class="pn">Mute audio</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Dolby Vision -->
+        <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.06)">
+          <div class="toggle-row">
+            <div style="flex:1">
+              <label style="margin-bottom:0"><i data-lucide="sparkles" style="width:18px;height:18px;vertical-align:-2px"></i> Preserve Dolby Vision<span class="info-icon" onclick="toggleInfoTip('dv-info-tip',event)"><i data-lucide="info" style="width:13px;height:13px"></i></span></label>
+              <div class="info-tip" id="dv-info-tip">{% if dovi_available %}Keeps DV metadata (RPU) — tone mapping on DV displays.<br>H.265 only · Profile 8 (iPhone) · adds ~1–8 min.{% else %}Place <code>dovi_tool.exe</code> in <code>bin/</code> to enable.{% endif %}</div>
+            </div>
+            <label class="toggle" style="margin-top:1px;flex-shrink:0">
+              <input type="checkbox" id="dv-preserve-toggle" onchange="setDvPreserve(this.checked)"{% if not dovi_available %} disabled{% else %} checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+      </div><!-- /adv-body -->
+    </div>
+
+    <input type="hidden" id="crf-value" value="24">
+    <div class="err" id="err-compress"></div>
+
+    <div class="prog-card hidden" id="prog-compress">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Total Progress: <span id="batch-progress-count" style="font-size:13px; font-weight:normal;"></span>
+        </div>
+        <span id="batch-elapsed-timer" style="font-size:13px; font-weight:700; color:var(--purple-l); font-variant-numeric:tabular-nums; letter-spacing:0.5px;"></span>
+      </div>
+      <div id="batch-progress-list" class="dark-scroll" style="max-height: 350px; overflow-y: auto; padding-right: 5px;"></div>
+    </div>
+
+    <div id="res-compress" class="hidden">
+      <div class="result-box">
+        <div class="res-badge" style="margin-bottom:15px"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> All tasks completed!</div>
+        <div id="batch-result-list" class="dark-scroll" style="max-height: 350px; overflow-y: auto; padding-right: 5px;"></div>
+      </div>
+      <div class="action-area" style="margin-top: 15px;">
+        <button class="btn btn-primary" onclick="location.reload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> Start new batch</button>
+      </div>
+    </div>
+
+    <div id="btn-area-compress" class="mt8">
+      <button class="btn btn-primary" id="btn-compress"
+              onclick="startCompress()" {{ 'disabled' if not tools.ffmpeg }}>
+        <i data-lucide="rocket" style="width:18px;height:18px;vertical-align:-2px"></i> Start compression
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════ SOCIAL ════════════════ -->
+  <div class="panel" id="tab-social">
+    <div class="card">
+      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Media file</div>
+      <div class="drop" id="drop-social">
+        <input type="file"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,image/jpeg,image/png,image/heic,image/heif,image/webp,.mp4,.mov,.mkv,.avi,.webm,.m4v,.jpg,.jpeg,.heic,.heif,.png,.webp"
+          onchange="onFileChange(this,'social')">
+        <span class="drop-icon"><i data-lucide="upload-cloud" style="width:48px;height:48px;stroke-width:1.5"></i></span>
+        <div class="drop-txt">Video or image</div>
+        <div class="drop-sub">Video & HEIC/JPG/PNG supported</div>
+      </div>
+      <div class="vinfo" id="vinfo-social">
+        <input type="file" id="repick-social" style="display:none"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,image/jpeg,image/png,image/heic,image/heif,image/webp,.mp4,.mov,.mkv,.avi,.webm,.m4v,.jpg,.jpeg,.heic,.heif,.png,.webp"
+          onchange="onFileChange(this,'social')">
+        <div class="vinfo-name">
+          <span class="vn-icon"><i data-lucide="paperclip" style="width:16px;height:16px"></i></span>
+          <span class="vn-text" id="vn-name-social"></span>
+          <button class="vn-btn" onclick="document.getElementById('repick-social').click()">Change file</button>
+        </div>
+        <div class="vinfo-loading hidden" id="vinfo-loading-social"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
+        <div class="vinfo-grid">
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="hard-drive"></i>Size</div><div class="vinfo-val" id="vi-size-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="file-video"></i>Type</div><div class="vinfo-val" id="vi-type-s">—</div></div>
+        </div>
+        <div class="vinfo-grid hidden" id="vinfo-video-s">
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="cpu"></i>Codec</div><div class="vinfo-val" id="vi-codec-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="scan"></i>Resolution</div><div class="vinfo-val" id="vi-res-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="activity"></i>FPS</div><div class="vinfo-val" id="vi-fps-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="clock"></i>Duration</div><div class="vinfo-val" id="vi-dur-s">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="music"></i>Audio</div><div class="vinfo-val" id="vi-audio-s">—</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="card-video-preset">
+      <div class="card-title"><i data-lucide="clapperboard" style="width:18px;height:18px;vertical-align:-2px"></i> Platform Preset</div>
+      <div class="preset-grid">
+        {% for key, p in social_presets.items() %}
+        <div class="preset-btn {% if loop.first %}active{% endif %}"
+             data-key="{{ key }}" onclick="selectSocialPreset('{{ key }}')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+          <span class="pi"><i data-lucide="{{ p.icon }}" style="width:24px;height:24px"></i></span>
+          <div class="pn">{{ p.label }}</div>
+          {% if p.sub %}<div class="ps">{{ p.sub }}</div>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="card hidden" id="card-photo-preset">
+      <div class="card-title"><i data-lucide="image" style="width:18px;height:18px;vertical-align:-2px"></i> Image Preset</div>
+      <div class="preset-grid">
+        {% for key, p in photo_presets.items() %}
+        <div class="preset-btn {% if loop.first %}active{% endif %}"
+             data-key="{{ key }}" onclick="selectPhotoPreset('{{ key }}')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
+          <span class="pi"><i data-lucide="{{ p.icon }}" style="width:24px;height:24px"></i></span>
+          <div class="pn">{{ p.label }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="err" id="err-social"></div>
+    <div class="prog-card hidden" id="prog-social">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Exporting...
+        </div>
+      </div>
+      <div class="prog-msg" id="msg-social"></div>
+      <div class="prog-track"><div class="prog-fill" id="bar-social"></div></div>
+      <div class="prog-meta"><span id="pct-social">0%</span><span id="eta-social"></span></div>
+    </div>
+    <div id="res-social" class="hidden">
+      <div class="result-box">
+        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Export successful!</div>
+        <div class="res-filename">
+          <span class="rf-icon"><i data-lucide="smartphone"></i></span>
+          <span class="rf-text" id="res-s-fname">—</span>
+        </div>
+        <div class="res-grid">
+          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Before</div><div class="res-val" id="res-s-before">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="file-check"></i>After</div><div class="res-val" id="res-s-after">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="trending-down"></i>Reduced</div><div class="res-val" id="res-s-pct">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Elapsed</div><div class="res-val" id="res-s-time">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="scan"></i>Resolution</div><div class="res-val" id="res-s-res">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="activity"></i>FPS</div><div class="res-val" id="res-s-fps">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="music"></i>Audio</div><div class="res-val" id="res-s-audio">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="layers"></i>Preset</div><div class="res-val" id="res-s-enc">—</div></div>
+        </div>
+        <div class="warn-box hidden" id="warn-social"></div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-success" onclick="doDownload('social')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download</button>
+        <button class="btn btn-outline" onclick="resetJob('social')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New file</button>
+      </div>
+    </div>
+    <div id="btn-area-social" class="mt8">
+      <button class="btn btn-primary" id="btn-social"
+              onclick="startSocial()" {{ 'disabled' if not tools.ffmpeg }}>
+        <i data-lucide="smartphone" style="width:18px;height:18px;vertical-align:-2px"></i> Export for Social
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════ AUDIO ════════════════ -->
+  <div class="panel" id="tab-audio">
+    <div class="card">
+      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Video file</div>
+      <div class="drop" id="drop-audio">
+        <input type="file"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'audio')">
+        <span class="drop-icon"><i data-lucide="music" style="width:48px;height:48px;stroke-width:1.5"></i></span>
+        <div class="drop-txt">Click to select video</div>
+        <div class="drop-sub">Will extract audio to a separate file</div>
+      </div>
+      <div class="vinfo" id="vinfo-audio">
+        <input type="file" id="repick-audio" style="display:none"
+          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+          onchange="onFileChange(this,'audio')">
+        <div class="vinfo-name">
+          <span class="vn-icon"><i data-lucide="music" style="width:16px;height:16px"></i></span>
+          <span class="vn-text" id="vn-name-audio"></span>
+          <button class="vn-btn" onclick="document.getElementById('repick-audio').click()">Change file</button>
+        </div>
+        <div class="vinfo-loading hidden" id="vinfo-loading-audio"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
+        <div class="vinfo-grid">
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="hard-drive"></i>Size</div><div class="vinfo-val" id="vi-size-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="cpu"></i>Original codec</div><div class="vinfo-val" id="vi-codec-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="scan"></i>Resolution</div><div class="vinfo-val" id="vi-res-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="activity"></i>FPS</div><div class="vinfo-val" id="vi-fps-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="clock"></i>Duration</div><div class="vinfo-val" id="vi-dur-a">—</div></div>
+          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="music"></i>Audio</div><div class="vinfo-val" id="vi-audio-a">—</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><i data-lucide="music" style="width:18px;height:18px;vertical-align:-2px"></i> Audio format</div>
+      <div class="preset-grid">
+        {% for key, af in audio_formats.items() %}
+        <div class="preset-btn {% if key=='mp3' %}active{% endif %}"
+             data-key="{{ key }}" onclick="selectAudioFmt('{{ key }}')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="{{ af.icon }}" style="width:24px;height:24px"></i></span>
+          <div class="pn">{{ af.label }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="err" id="err-audio"></div>
+    <div class="prog-card hidden" id="prog-audio">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Extracting audio...
+        </div>
+      </div>
+      <div class="prog-msg" id="msg-audio"></div>
+      <div class="prog-track"><div class="prog-fill" id="bar-audio"></div></div>
+      <div class="prog-meta"><span id="pct-audio">0%</span><span id="eta-audio"></span></div>
+    </div>
+    <div id="res-audio" class="hidden">
+      <div class="result-box">
+        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Audio extracted successfully!</div>
+        <div class="res-grid">
+          <div class="res-item"><div class="res-label"><i data-lucide="music"></i>Format</div><div class="res-val" id="res-a-fmt">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Size</div><div class="res-val" id="res-a-size">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="timer"></i>Duration</div><div class="res-val" id="res-a-dur">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Elapsed</div><div class="res-val" id="res-a-time">—</div></div>
+        </div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-success" onclick="doDownload('audio')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download</button>
+        <button class="btn btn-outline" onclick="resetJob('audio')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New file</button>
+      </div>
+    </div>
+    <div id="btn-area-audio" class="mt8">
+      <button class="btn btn-primary" id="btn-audio"
+              onclick="startAudio()" {{ 'disabled' if not tools.ffmpeg }}>
+        <i data-lucide="music" style="width:18px;height:18px;vertical-align:-2px"></i> Extract audio
+      </button>
+    </div>
+  </div>
+
+  <!-- ════════════════ DOWNLOAD ════════════════ -->
+  <div class="panel" id="tab-download">
+    {% if not tools.ytdlp %}
+    <div class="err" style="display:block"><i data-lucide="x-circle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> yt-dlp not installed! Place yt-dlp.exe in the app.py folder</div>
+    {% endif %}
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div class="card-title" style="margin-bottom:0"><i data-lucide="link" style="width:18px;height:18px;vertical-align:-2px"></i> Video / audio / playlist URL</div>
+        <div style="display:flex;gap:4px;background:rgba(0,0,0,.25);border:1px solid var(--card-border);border-radius:100px;padding:3px">
+          <button id="dlmode-single" class="dlmode-btn active" onclick="setDlMode('single',this)"><i data-lucide="link" style="width:13px;height:13px;vertical-align:-2px"></i> Single</button>
+          <button id="dlmode-batch"  class="dlmode-btn"        onclick="setDlMode('batch',this)"><i data-lucide="list" style="width:13px;height:13px;vertical-align:-2px"></i> Batch</button>
+        </div>
+      </div>
+      <div id="dl-single-row" class="url-row">
+        <input type="url" id="dl-url" class="dark-input" placeholder="https://youtube.com/watch?v=..." oninput="onUrlChange()">
+      </div>
+      <div id="dl-batch-row" style="display:none">
+        <textarea id="dl-urls" class="dark-input" rows="5"
+          placeholder="One URL per line:&#10;https://youtube.com/watch?v=...&#10;https://tiktok.com/@user/video/..."
+          style="width:100%;box-sizing:border-box;resize:vertical;font-size:13px;line-height:1.6;font-family:inherit"></textarea>
+        <div style="font-size:11px;color:var(--text-3);margin-top:4px"><i data-lucide="info" style="width:12px;height:12px;vertical-align:-1px;color:var(--blue)"></i> Each URL on a separate line. Playlist and quality settings apply to all.</div>
+      </div>
+      <div class="dl-title-preview" id="dl-title"></div>
+
+      {% if is_server %}
+      <div class="card-title" style="margin-top:16px"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Save folder</div>
+      <div id="folder-display"
+           style="display:flex;align-items:center;gap:12px;background:rgba(var(--purple-rgb), 0.04);border:1px solid rgba(var(--purple-rgb), 0.2);border-radius:var(--radius-sm);padding:11px 14px;cursor:pointer;transition:all 0.2s;user-select:none;margin-bottom:6px"
+           onmouseover="this.style.background='rgba(var(--purple-rgb), 0.09)';this.style.borderColor='rgba(var(--purple-rgb), 0.45)'"
+           onmouseout="this.style.background='rgba(var(--purple-rgb), 0.04)';this.style.borderColor='rgba(var(--purple-rgb), 0.2)'"
+           onclick="browseFolder()">
+        <i data-lucide="folder-open" style="width:22px;height:22px;color:var(--purple-l);flex-shrink:0"></i>
+        <div style="flex:1;overflow:hidden;min-width:0">
+          <div id="folder-name-display" style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+          <div id="folder-path-display" style="font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px"></div>
+        </div>
+        <button id="btn-browse-folder"
+                onclick="event.stopPropagation();browseFolder()"
+                style="flex-shrink:0;background:rgba(var(--purple-rgb), 0.1);border:1px solid rgba(var(--purple-rgb), 0.3);color:var(--purple-l);border-radius:var(--radius-sm);padding:5px 11px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit;display:flex;align-items:center;gap:5px;white-space:nowrap">
+          <i data-lucide="pencil" style="width:12px;height:12px"></i>
+          <span id="btn-browse-text">Change</span>
+        </button>
+      </div>
+      <input type="hidden" id="dl-output-dir" value="{{ default_out_dir }}">
+      {% else %}
+      <input type="hidden" id="dl-output-dir" value="{{ default_out_dir }}">
+      {% endif %}
+    </div>
+    <div class="card" id="card-dl-settings">
+      <div class="card-title"><i data-lucide="download-cloud" style="width:18px;height:18px;vertical-align:-2px"></i> Download type</div>
+      <div class="preset-grid mb12" style="margin-bottom:12px">
+        <div class="preset-btn active" id="dl-type-video" onclick="setDlType('video')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="clapperboard"></i></span><div class="pn">Video</div>
+        </div>
+        <div class="preset-btn" id="dl-type-audio" onclick="setDlType('audio')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="music"></i></span><div class="pn">Audio only</div>
+        </div>
+      </div>
+      <div id="dl-video-opts">
+        <label>Video quality</label>
+        <div>
+          <div class="cs-wrap" id="cs-dl-quality">
+            <div class="cs-trigger" onclick="toggleCS('cs-dl-quality')">
+              <span class="cs-val" id="cs-dl-quality-val"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              <div class="cs-option selected" data-value="best" onclick="pickDlQuality('best', this.innerHTML)"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</div>
+              <div class="cs-option" data-value="1080p" onclick="pickDlQuality('1080p', this.innerHTML)"><i data-lucide="monitor" style="width:14px;height:14px;vertical-align:-2px"></i> 1080p</div>
+              <div class="cs-option" data-value="720p" onclick="pickDlQuality('720p', this.innerHTML)"><i data-lucide="smartphone" style="width:14px;height:14px;vertical-align:-2px"></i> 720p</div>
+              <div class="cs-option" data-value="480p" onclick="pickDlQuality('480p', this.innerHTML)"><i data-lucide="save" style="width:14px;height:14px;vertical-align:-2px"></i> 480p</div>
+            </div>
+          </div>
+          <input type="hidden" id="dl-quality" value="best">
+        </div>
+      </div>
+      <div id="dl-audio-opts" class="hidden">
+        <label>Audio quality</label>
+        <div>
+          <div class="cs-wrap" id="cs-dl-audio">
+            <div class="cs-trigger" onclick="toggleCS('cs-dl-audio')">
+              <span class="cs-val" id="cs-dl-audio-val">{{ download_audio_quality['m4a'].label|safe }}</span>
+              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+            </div>
+            <div class="cs-dropdown">
+              {% for key, aq in download_audio_quality.items() %}
+              <div class="cs-option {{ 'selected' if key == 'm4a' else '' }}" data-value="{{ key }}" onclick="pickDlAudio('{{ key }}', this.innerHTML)">{{ aq.label|safe }}</div>
+              {% endfor %}
+            </div>
+          </div>
+          <input type="hidden" id="dl-audio-fmt" value="m4a">
+        </div>
+      </div>
+      <div class="adv-toggle" id="adv-toggle-download"
+           onclick="toggleAdv('adv-download','adv-arrow-download','adv-toggle-download')">
+        <div class="adv-toggle-left"><span><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i></span><span>Advanced options</span></div>
+        <span class="adv-arrow" id="adv-arrow-download"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
+      </div>
+      <div class="adv-body" id="adv-download">
+      <label class="playlist-toggle">
+        <input type="checkbox" id="dl-playlist" checked>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="clipboard-list" style="width:16px;height:16px;vertical-align:-2px"></i> Download entire playlist</div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Download all videos in the playlist</div>
+        </div>
+      </label>
+      <label class="playlist-toggle" style="margin-top:8px">
+        <input type="checkbox" id="dl-subs" onchange="$('dl-subs-lang').style.display=this.checked?'flex':'none'">
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="subtitles" style="width:16px;height:16px;vertical-align:-2px"></i> Download subtitles</div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Embed subtitles into video file</div>
+        </div>
+      </label>
+      <div id="dl-subs-lang" style="display:none;align-items:center;gap:8px;margin-top:6px;padding:8px 10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
+        <span style="font-size:12px;color:var(--text-3);white-space:nowrap"><i data-lucide="languages" style="width:14px;height:14px;vertical-align:-2px"></i> Languages:</span>
+        <input type="text" id="dl-subs-lang-val" class="dark-input" placeholder="vi,en" value="vi,en" style="flex:1;padding:6px 10px;font-size:13px">
+        <span style="font-size:11px;color:var(--text-3);white-space:nowrap">comma-separated</span>
+      </div>
+      <label class="playlist-toggle" style="margin-top:8px">
+        <input type="checkbox" id="dl-trim-enable" onchange="$('dl-trim-inputs').style.display=this.checked?'block':'none';updateDlTrimHint()" disabled>
+        <div id="dl-trim-text" style="opacity:0.4; transition:opacity 0.3s">
+          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="scissors" style="width:16px;height:16px;vertical-align:-2px"></i> Download time range</div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Only available after video duration is loaded</div>
+        </div>
+      </label>
+      <div id="dl-trim-inputs" style="display:none;margin-top:6px;padding:10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="play" style="width:11px;height:11px;vertical-align:-1px"></i> Start</div>
+            <input type="text" id="dl-trim-start" class="dark-input" placeholder="e.g. 1:30 or 90" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="square" style="width:11px;height:11px;vertical-align:-1px"></i> End</div>
+            <input type="text" id="dl-trim-end" class="dark-input" placeholder="e.g. 2:45" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text-3);text-align:center;margin-top:6px;font-style:italic">Format: Seconds (e.g. 90) or MM:SS (e.g. 1:30) or HH:MM:SS</div>
+        <div id="dl-trim-hint" style="margin-top:5px;font-size:11px;color:var(--text-3);text-align:center;min-height:16px"></div>
+      </div>
+      <div class="section-label" style="margin-top:12px"><i data-lucide="cookie" style="width:18px;height:18px;vertical-align:-2px"></i> Cookie</div>
+      <div class="cookie-status" id="cookie-file-status"></div>
+      <div class="preset-grid preset-grid-3" style="gap:6px">
+        <div class="preset-btn active" data-browser="none" onclick="selectBrowser('none')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="ban"></i></span><div class="pn">None</div>
+        </div>
+        <div class="preset-btn" data-browser="cookies_txt" onclick="selectBrowser('cookies_txt')" id="btn-cookies-txt">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="file-text"></i></span>
+          <div class="pn" id="lbl-cookies-txt">cookies.txt</div>
+        </div>
+        <div class="preset-btn" data-browser="chrome" onclick="selectBrowser('chrome')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="globe" style="width:24px;height:24px"></i></span><div class="pn">Chrome</div>
+        </div>
+        <div class="preset-btn" data-browser="edge" onclick="selectBrowser('edge')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="compass" style="width:24px;height:24px"></i></span><div class="pn">Edge</div>
+        </div>
+        <div class="preset-btn" data-browser="firefox" onclick="selectBrowser('firefox')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="flame" style="width:24px;height:24px"></i></span><div class="pn">Firefox</div>
+        </div>
+        <div class="preset-btn" data-browser="brave" onclick="selectBrowser('brave')">
+          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="shield" style="width:24px;height:24px"></i></span><div class="pn">Brave</div>
+        </div>
+      </div>
+      <div class="browser-warn" id="browser-warn">
+        <i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> <strong>Completely close</strong> your browser before downloading! Or use cookies.txt.
+      </div>
+      <div class="cookies-guide" id="cookies-txt-guide">
+        <i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Install <strong>"Get cookies.txt LOCALLY"</strong> on Chrome/Edge → Export → Place in app.py folder
+      </div>
+      </div><!-- /adv-body -->
+    </div><!-- /card -->
+    <div class="err" id="err-download"></div>
+    <div class="prog-card hidden" id="prog-download">
+      <div class="prog-title">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Downloading...
+        </div>
+        <button id="btn-cancel-download" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:var(--red);border-radius:var(--radius-sm);padding:4px 10px;cursor:pointer;font-size:11px;font-weight:600;font-family:inherit;transition:all 0.2s;"><i data-lucide="x" style="width:14px;height:14px;vertical-align:-2px"></i> Cancel</button>
+      </div>
+      <div class="prog-msg" id="msg-download"></div>
+      <div class="prog-track"><div class="prog-fill" id="bar-download"></div></div>
+      <div class="prog-meta"><span id="pct-download">0%</span><span id="eta-download"></span></div>
+    </div>
+    <div id="res-download" class="hidden">
+      <div class="result-box">
+        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Download successful!</div>
+        <div class="res-filename">
+          <span class="rf-icon"><i data-lucide="globe"></i></span>
+          <span class="rf-text" id="res-d-title">—</span>
+          <span class="rf-badge hidden" id="res-d-count-item"><span id="res-d-count"></span></span>
+        </div>
+        <div class="res-grid">
+          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Size</div><div class="res-val" id="res-d-size">—</div></div>
+          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Download time</div><div class="res-val" id="res-d-time">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="clock"></i>Duration</div><div class="res-val" id="res-d-dur">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="scan"></i>Resolution</div><div class="res-val" id="res-d-res">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="activity"></i>FPS</div><div class="res-val" id="res-d-fps">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="music"></i>Audio</div><div class="res-val" id="res-d-audio">—</div></div>
+          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="layers"></i>Format</div><div class="res-val" id="res-d-enc">—</div></div>
+          {% if is_server %}
+          <div class="res-item" onclick="openFolder('download')" style="cursor:pointer; transition: all 0.2s; border: 1px dashed rgba(var(--green-rgb), 0.3); background: rgba(var(--green-rgb), 0.05);" onmouseover="this.style.background='rgba(var(--green-rgb), 0.1)'; this.style.borderColor='rgba(var(--green-rgb), 0.6)';" onmouseout="this.style.background='rgba(var(--green-rgb), 0.05)'; this.style.borderColor='rgba(var(--green-rgb), 0.3)';">
+             <div class="res-label" style="color:var(--green); display: flex; align-items: center; justify-content: space-between;">Save folder <i data-lucide="external-link" style="width:12px;height:12px;opacity:0.7;"></i></div>
+             <div class="res-val" style="color:var(--green); font-weight: 700; display: flex; align-items: center; gap: 6px; margin-top:4px;">
+               <i data-lucide="folder-open" style="width:18px;height:18px;"></i> Click to open folder
+             </div>
+          </div>
+          {% endif %}
+        </div>
+        <div class="warn-box hidden" id="warn-download"></div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-success hidden" id="btn-dl-file" onclick="doDownload('download')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download to device</button>
+        <button class="btn btn-outline" onclick="resetJob('download')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New download</button>
+      </div>
+    </div>
+
+    <!-- Batch download result list -->
+    <div id="res-batch-dl" class="hidden">
+      <div class="result-box" style="padding:0;overflow:hidden">
+        <div style="padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.06);font-size:12px;font-weight:600;color:var(--text-2);display:flex;justify-content:space-between;align-items:center">
+          <span><i data-lucide="list" style="width:14px;height:14px;vertical-align:-2px"></i> Batch download</span>
+          <span id="batch-dl-summary" style="color:var(--text-3)"></span>
+        </div>
+        <div id="batch-dl-list" style="max-height:400px;overflow-y:auto"></div>
+      </div>
+      <div class="action-area">
+        <button class="btn btn-outline" onclick="resetBatchDownload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New batch</button>
+      </div>
+    </div>
+    <div id="btn-area-download" class="mt8">
+      <button class="btn btn-primary" id="btn-download-start"
+              onclick="startDownload()" {{ 'disabled' if not tools.ytdlp }}>
+        <i data-lucide="download-cloud" style="width:18px;height:18px;vertical-align:-2px"></i> Start download
+      </button>
+    </div>
+  </div>
+
+</div>
+
+<!-- Log Modal -->
+<div id="log-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:var(--bg); border:1px solid var(--card-border); border-radius:var(--radius-sm); width:100%; max-width:800px; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5);">
+    <div style="padding:16px 20px; border-bottom:1px solid var(--card-border); display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="margin:0; font-size:16px; display:flex; align-items:center; gap:8px;">
+          <span style="color:var(--red);"><i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i></span> <span id="log-modal-title">FFmpeg Error Details</span>
+        </h3>
+        <div style="display:flex; align-items:center; gap:16px;">
+          <button onclick="copyLog(this)" style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:var(--text-2); border-radius:var(--radius-sm); padding:6px 12px; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:6px; transition:all 0.2s; font-weight:600; font-family:inherit;" onmouseover="this.style.background='rgba(255,255,255,0.1)'; this.style.color='var(--text)';" onmouseout="this.style.background='rgba(255,255,255,0.05)'; this.style.color='var(--text-2)';">
+            <i data-lucide="copy" style="width:14px;height:14px"></i>
+            <span>Copy</span>
+          </button>
+          <button onclick="document.getElementById('log-modal').style.display='none'" style="background:transparent; border:none; color:var(--text-3); cursor:pointer; display:flex; align-items:center; justify-content:center; padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--text)';" onmouseout="this.style.color='var(--text-3)';"><i data-lucide="x" style="width:20px;height:20px"></i></button>
+        </div>
+      </div>
+    <div style="padding:20px; flex:1; overflow-y:auto;">
+      <textarea id="log-content" readonly style="width:100%; height:400px; background:rgba(0,0,0,0.5); border:1px solid var(--card-border); border-radius:var(--radius-sm); color:var(--green); font-family:monospace; font-size:12px; padding:12px; resize:none;" class="dark-scroll"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- Metadata Compare Modal -->
+<div id="meta-compare-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center; padding:20px;" onclick="if(event.target===this)this.style.display='none';">
+  <div style="background:var(--bg); border:1px solid var(--card-border); border-radius:var(--radius-sm); width:100%; max-width:700px; max-height:80vh; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5);">
+    <div style="padding:16px 20px; border-bottom:1px solid var(--card-border); display:flex; justify-content:space-between; align-items:center; flex-shrink:0;">
+      <h3 style="margin:0; font-size:16px; display:flex; align-items:center; gap:8px;">
+        <i data-lucide="table-2" style="width:16px;height:16px;color:var(--purple-l);flex-shrink:0;"></i> <span>Metadata Comparison</span>
+      </h3>
+      <button onclick="document.getElementById('meta-compare-modal').style.display='none'" style="background:transparent; border:none; color:var(--text-3); cursor:pointer; display:flex; align-items:center; justify-content:center; padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--text)';" onmouseout="this.style.color='var(--text-3)';"><i data-lucide="x" style="width:20px;height:20px"></i></button>
+    </div>
+    <div id="meta-compare-body" style="padding:0; flex:1; overflow-y:auto;" class="dark-scroll"></div>
+  </div>
+</div>
+
+<script>
+  window.CRF_DEFAULTS = {{ crf_defaults|tojson }};
+  window.IS_SERVER = {{ 'true' if is_server else 'false' }};
+  lucide.createIcons();
+</script>
+<script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
+  <!-- Custom Modal -->
+  <div id="custom-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-icon" id="modal-icon"></div>
+      <h3 id="modal-title" style="margin:0 0 10px 0; font-size:18px; color:var(--text); text-align:center;"></h3>
+      <p id="modal-message" style="margin:0 0 20px 0; font-size:14px; color:var(--text-2); text-align:center; line-height:1.5;"></p>
+      <div style="display:flex; gap:10px; justify-content:center; width:100%;">
+        <button id="modal-btn-cancel" class="btn btn-outline" style="flex:1;">Cancel</button>
+        <button id="modal-btn-ok" class="btn btn-primary" style="flex:1;">OK</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
 
 ===== FILE: app/workers/compress.py =====
 import os, re, time, tempfile, shutil, subprocess
 from pathlib import Path
 from app.jobs import jobs, procs, _jobs_lock
-from app.config import FFMPEG_BIN, OUTPUT_DIR, CONTAINER_CODEC_SUPPORT, DOVI_TOOL_BIN, TEMP_DIR
+from app.config import FFMPEG_BIN, OUTPUT_DIR, CONTAINER_CODEC_SUPPORT, DOVI_TOOL_BIN, TEMP_DIR, CRF_DEFAULTS, CRF_AUTO_OFFSETS
+from app.config import _cpu_cores, _cpu_h_slots
 from app.utils import (
     _probe, _fmt_size, _fmt_time, _sync_meta, _unique_output_path,
     _get_exif_snapshot, _get_dv_info, _detect_dolby_vision, _inject_dvcc,
-    _annexb_to_mp4_samples, _dovi_mux_with_timestamps
+    _annexb_to_mp4_samples, _dovi_mux_with_timestamps, _fix_mebx_tracks,
+    _get_rotation
 )
 from app.encoder import (
     _get_codec_family, _get_real_enc_extra, _quality_args, _hwaccel_args, _pick_sem
@@ -1550,16 +2515,61 @@ from app.workers import job_guard, _run_progress, _check_path_len_job
 from app.platform_utils import free_ram_mb
 
 _DOVI_AVAILABLE = bool(DOVI_TOOL_BIN) and Path(DOVI_TOOL_BIN).exists()
+_META_HANDLER_TAGS = frozenset({"Core Media Data Handler", "GoPro MET", "Handler", "DataHandler"})
 
-# libx265 encoding 4K 10-bit needs ~3 GB RAM with default settings.
-# On low-RAM systems, apply thread/lookahead limits to avoid OOM.
-_X265_LOW_RAM_MB = 3000
+# Threads per concurrent CPU H265/H264 job.
+# When _cpu_h_slots jobs run in parallel, each gets an equal share of cores.
+# Example: 12 cores / 2 slots → 6 threads/job → 2 jobs × 6 = 12 threads (full CPU),
+# but RAM per job drops from ~3.5 GB to ~1.5 GB → safe for concurrent 4K batches.
+_cpu_h_per_job = max(4, _cpu_cores // max(1, _cpu_h_slots))
+_X265_LOW_RAM_MB    = 4000   # threshold for 4K jobs
+_X265_LOW_RAM_1080P = 1500   # threshold for 1080p jobs
 
-def _x265_mem_params():
-    """Return memory-limiting x265-params when free RAM < 3 GB, else []."""
-    if free_ram_mb() < _X265_LOW_RAM_MB:
-        return ["-x265-params", "pools=1:frame-threads=1:lookahead-threads=1:rc-lookahead=5:bframes=0"]
-    return []
+def _build_x265_params(width: int = 0, height: int = 0) -> list:
+    """
+    Build -x265-params string for libx265.
+
+    Concurrency strategy for 4K:
+    - _cpu_h_slots >= 2: partition thread pool so each concurrent job uses
+      _cpu_h_per_job threads instead of all cores. Total CPU remains 100%,
+      but RAM per job halves → no OOM on concurrent 4K batches.
+    - _cpu_h_slots == 1 (single job): use all cores freely; apply RAM-based
+      limits only if the system is genuinely low on memory.
+
+    This function is called AFTER acquiring the CPU semaphore (post-queue-wait),
+    so free_ram_mb() reflects actual memory pressure at encode start time.
+    """
+    params  = "psy-rd=1.0:psy-rdoq=0.5:aq-mode=3:aq-strength=0.8:pme=1"
+    is_4k   = (width >= 3840 or height >= 2160)
+    ram_now = free_ram_mb()
+
+    if is_4k and _cpu_h_slots >= 2:
+        # Partition: each job gets _cpu_h_per_job threads.
+        # frame-threads ≈ threads/4, capped at 4 (diminishing returns above).
+        ft = max(1, min(4, _cpu_h_per_job // 4))
+        params += (f":pools={_cpu_h_per_job}:frame-threads={ft}"
+                   ":lookahead-threads=1:rc-lookahead=20:bframes=3")
+    elif ram_now < _X265_LOW_RAM_MB:
+        # Single-job or low-RAM fallback: apply conservative limits.
+        if is_4k:
+            params += ":pools=1:frame-threads=1:lookahead-threads=1:rc-lookahead=20:bframes=3"
+        elif ram_now < _X265_LOW_RAM_1080P:
+            params += ":pools=2:lookahead-threads=1:rc-lookahead=20"
+    return ["-x265-params", params]
+
+def _auto_crf(enc: str, width: int, height: int) -> int:
+    """Return resolution-aware CRF for Auto mode.
+    Uses Highest quality base (CRF_DEFAULTS[enc][0]) + resolution offset,
+    so perceptual quality stays consistent across resolutions in a batch.
+    av1_amf uses QVBR (inverted scale) → offset is subtracted.
+    """
+    base = CRF_DEFAULTS.get(enc, (24, 28, 32, 51))[0]
+    px   = (width or 0) * (height or 0)
+    for limit, off in CRF_AUTO_OFFSETS:
+        if px < limit:
+            return base - off if enc == "av1_amf" else base + off
+    return base  # fallback — unreachable in practice (float('inf') always matches)
+
 
 
 def _job_msg(job_id, msg, pct):
@@ -1569,10 +2579,16 @@ def _job_msg(job_id, msg, pct):
             jobs[job_id]["progress"] = pct
 
 
+def _dovi_cancelled(job_id) -> bool:
+    with _jobs_lock:
+        return jobs.get(job_id, {}).get("cancelled", False)
+
+
 def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
-                              mute, best_audio_idx, target_kbps, total_s, ppath, fps_str):
+                              mute, best_audio_idx, target_kbps, total_s, ppath,
+                              meta_stream_indices=None, x265_params=None):
     """
-    Dolby Vision preserving pipeline — 7 steps.
+    Dolby Vision preserving pipeline — 9 steps.
 
     Key insight: B-frame PTS/DTS live in the MOV container's CTTS table, not in
     the raw HEVC bitstream. By encoding to a full temp.mov first (so CTTS is
@@ -1597,6 +2613,8 @@ def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
         if r.returncode != 0:
             raise RuntimeError(f"HEVC extract failed: {r.stderr.decode(errors='replace')[-1000:]}")
 
+        if _dovi_cancelled(job_id): return -1, False
+
         # Step 2: Extract DV RPU metadata
         _job_msg(job_id, "Extracting DV RPU metadata...", 5)
         r = subprocess.run([DOVI_TOOL_BIN, "extract-rpu",
@@ -1605,15 +2623,17 @@ def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
         if r.returncode != 0:
             raise RuntimeError(f"RPU extract failed: {r.stderr.decode(errors='replace')[-1000:]}")
 
+        if _dovi_cancelled(job_id): return -1, False
+
         # Step 3: Encode to temp.mov — full output with B-frames, audio, metadata.
         # B-frames are ALLOWED here: the container (temp.mov) correctly stores their
         # PTS/DTS in the CTTS box. We'll preserve this CTTS in the final output.
         _job_msg(job_id, f"Encoding DV base layer ({real_enc})...", 8)
-        x265_mem = _x265_mem_params() if real_enc == "libx265" else []
+        x265_mem = (x265_params or []) if real_enc == "libx265" else []
         audio_map = [] if mute else ["-map", f"0:a:{best_audio_idx}"]
         audio_enc = [] if mute else ["-c:a", "aac", "-b:a", f"{target_kbps}k",
                                      "-ar", "48000", "-ac", "2"]
-        encode_cmd = ([FFMPEG_BIN] + _hwaccel_args(real_enc) +
+        encode_cmd = ([FFMPEG_BIN, "-noautorotate"] + _hwaccel_args(real_enc) +
                       ["-i", str(src), "-map", "0:v:0"] + audio_map +
                       ["-c:v", real_enc] +
                       _quality_args(enc, crf) + enc_extra + x265_mem +
@@ -1626,6 +2646,8 @@ def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
         if rc != 0:
             return rc, is_oom
 
+        if _dovi_cancelled(job_id): return -1, False
+
         # Step 4: Extract Annex-B HEVC from temp_mov (loses container timestamps,
         # but that's OK — we will restore them via binary patching in Step 7).
         _job_msg(job_id, "Extracting encoded HEVC stream...", 97)
@@ -1635,6 +2657,8 @@ def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
                            capture_output=True, timeout=120)
         if r.returncode != 0:
             raise RuntimeError(f"HEVC extract from temp failed: {r.stderr.decode(errors='replace')[-1000:]}")
+
+        if _dovi_cancelled(job_id): return -1, False
 
         # Step 5: Inject RPU NAL units into the encoded HEVC bitstream
         _job_msg(job_id, "Injecting Dolby Vision metadata...", 98)
@@ -1659,7 +2683,33 @@ def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
         if not _dovi_mux_with_timestamps(str(temp_mov), dv_samples, str(dst)):
             raise RuntimeError("_dovi_mux_with_timestamps failed — falling back not available")
 
-        # Step 8: Copy dvvC/dvcC atom from source → output
+        # Step 8: Transplant mebx (Core Media Metadata) tracks from source into dst.
+        # These tracks carry dual-camera composition and Action Mode timed metadata
+        # that iOS Photos uses to display feature icons and "Camera mặt trước" info.
+        # FFmpeg corrupts mebx hdlr/stsd; _fix_mebx_tracks patches them back.
+        if meta_stream_indices:
+            _job_msg(job_id, "Copying metadata tracks...", 99)
+            mebx_out = tmp / "with_mebx.mov"
+            mebx_maps = []
+            for idx in meta_stream_indices:
+                mebx_maps += ["-map", f"1:{idx}"]
+            mebx_cmd = ([FFMPEG_BIN, "-y",
+                         "-i", str(dst), "-i", str(src),
+                         "-map", "0", "-c", "copy"] +
+                        mebx_maps +
+                        ["-c:d", "copy",
+                         "-tag:v", "hvc1",
+                         "-movflags", "use_metadata_tags+faststart",
+                         str(mebx_out)])
+            try:
+                r = subprocess.run(mebx_cmd, capture_output=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                r = None  # graceful: keep dst as-is (core DV already written)
+            if r is not None and r.returncode == 0 and mebx_out.exists() and mebx_out.stat().st_size > 1024:
+                _fix_mebx_tracks(str(mebx_out))
+                os.replace(str(mebx_out), str(dst))
+
+        # Step 9: Copy dvvC/dvcC atom from source → output
         _job_msg(job_id, "Restoring Dolby Vision container signaling...", 99)
         _inject_dvcc(str(src), str(dst))
 
@@ -1675,11 +2725,19 @@ def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
 
 @job_guard
 def _compress_job(job_id, src: Path, enc: str, crf: int,
-                  out_ext: str, mute: bool = False):
+                  out_ext: str, mute: bool = False, preserve_dv: bool = False,
+                  crf_auto: bool = False):
     with _jobs_lock:
         if job_id not in jobs:
             return
         job = jobs[job_id]
+
+    if not src.exists():
+        with _jobs_lock:
+            job["status"]  = "error"
+            job["message"] = "Source file not found. Please reselect."
+        return
+
     family = _get_codec_family(enc)
     t0     = None
 
@@ -1689,17 +2747,19 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
     av1_warning = ""
     if family == "av1" and out_ext == ".mov":
         out_ext = ".mp4"
-        av1_warning = " (Tự đổi sang MP4)"
+        av1_warning = " (auto-converted to MP4)"
 
     supported = CONTAINER_CODEC_SUPPORT.get(out_ext, ["h264"])
     if family not in supported:
         if out_ext == ".webm":
             enc = "libaom-av1"
-            job["message"] = "⚠️ .WebM only supports AV1 → auto-switching to libaom-AV1"
+            _msg = "⚠️ .WebM only supports AV1 → auto-switching to libaom-AV1"
         else:
             enc = "libx264"
-            job["message"] = f"⚠️ {out_ext.upper()} does not support {family.upper()} → switching to H.264"
+            _msg = f"⚠️ {out_ext.upper()} does not support {family.upper()} → switching to H.264"
         family = _get_codec_family(enc)
+        with _jobs_lock:
+            job["message"] = _msg
 
     dst = _unique_output_path(src_stem, out_ext)
     if not _check_path_len_job(dst, job_id):
@@ -1707,7 +2767,7 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
         except: pass
         try: src.unlink()
         except: pass
-        return
+        return  # ppath not yet created at this point
 
     real_enc, enc_extra = _get_real_enc_extra(enc)
 
@@ -1717,19 +2777,31 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
     probe_data     = _probe(str(src))
     total_s        = float(probe_data.get("format", {}).get("duration") or 0)
 
-    fps_str = "30000/1001"  # default 29.97 fps (iPhone)
-    for s in probe_data.get("streams", []):
-        if s.get("codec_type") == "video":
-            avg = s.get("avg_frame_rate", "0/0")
-            if avg and avg != "0/0":
-                fps_str = avg
-            else:
-                fps_str = s.get("r_frame_rate", "30000/1001")
+    # Extract video dimensions and rotation for resolution-aware params and metadata sync
+    video_w = video_h = 0
+    src_rotation = 0
+    for _s in probe_data.get("streams", []):
+        if _s.get("codec_type") == "video":
+            video_w = int(_s.get("width",  0) or 0)
+            video_h = int(_s.get("height", 0) or 0)
+            src_rotation = _get_rotation(_s)
             break
+    if crf_auto:
+        crf = _auto_crf(enc, video_w, video_h)
+        with _jobs_lock:
+            if job_id in jobs:
+                jobs[job_id]["effective_crf"] = crf
+                jobs[job_id]["crf_auto"] = True
+
+    # x265_params will be rebuilt inside the encode loop (after queue wait)
+    # so it reads free RAM at the moment encoding actually starts — not when
+    # multiple siblings may not have loaded yet.
+    _is_x265   = (real_enc == "libx265")
+    x265_params = []  # populated inside retry loop for libx265; empty for all others
 
     # Dolby Vision detection
     is_dv, dv_profile = _get_dv_info(probe_data)
-    use_dovi = is_dv and _DOVI_AVAILABLE
+    use_dovi = is_dv and _DOVI_AVAILABLE and preserve_dv
 
     # Store source metadata snapshot
     src_exif = _get_exif_snapshot(str(src))
@@ -1739,6 +2811,7 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
 
     best_audio_idx = 0
     best_audio_br  = 0
+    _apac_idx      = None  # last-resort fallback if apac is the only stream
     audio_streams_raw = [
         s for s in probe_data.get("streams", [])
         if s.get("codec_type") == "audio" and s.get("codec_name") and s.get("codec_name") != "none"
@@ -1746,48 +2819,71 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
     audio_streams = list(enumerate(audio_streams_raw))
     for stream_idx, s in audio_streams:
         # Prefer decodable AAC (mp4a) over Apple Lossless/spatial (apac).
-        # apac is a 3-4ch spatial stream: re-encoding it to stereo AAC without
-        # proper downmix causes iOS playback stutter (timing desync with mebx tracks).
+        # apac is a 3-4ch spatial stream: re-encoding to stereo AAC without proper
+        # downmix causes iOS playback stutter (timing desync with mebx tracks).
+        # Track apac separately — only use if no other decodable stream exists.
         codec_tag = s.get("codec_tag_string", "").lower()
         if codec_tag == "apac":
-            # Only use apac if no other audio stream exists
-            if best_audio_br > 0:
-                continue
-            br = 1   # placeholder — will be overridden by any real decodable stream
-        else:
-            br = 0
-            raw_br = s.get("bit_rate")
-            if raw_br:
-                try: br = int(raw_br)
+            if _apac_idx is None:
+                _apac_idx = stream_idx
+            continue
+        br = 0
+        raw_br = s.get("bit_rate")
+        if raw_br:
+            try: br = int(raw_br)
+            except: pass
+        if br < 10000:
+            tags = s.get("tags", {})
+            bps  = tags.get("BPS") or tags.get("BPS-eng")
+            if bps:
+                try: br = int(bps)
                 except: pass
-            if br < 10000:
-                tags = s.get("tags", {})
-                bps  = tags.get("BPS") or tags.get("BPS-eng")
-                if bps:
-                    try: br = int(bps)
-                    except: pass
-            if br < 10000:
-                ch = s.get("channels", 0)
-                sr = s.get("sample_rate", 0)
-                if ch and sr:
-                    br = ch * int(sr) * 16
+        if br < 10000:
+            ch = s.get("channels", 0)
+            sr = s.get("sample_rate", 0)
+            if ch and sr:
+                br = ch * int(sr) * 16
         if br > best_audio_br:
             best_audio_br  = br
             best_audio_idx = stream_idx
 
-    cmd = [FFMPEG_BIN] + _hwaccel_args(real_enc) + ["-i", str(src), "-map", "0:v:0"]
+    # If no decodable stream found, fall back to apac.
+    # best_audio_br stays 0 → target_kbps correctly falls back to 192k default.
+    if best_audio_br == 0 and _apac_idx is not None:
+        best_audio_idx = _apac_idx
+
+    # Detect Apple metadata tracks (mebx, tmcd) — carry iPhone feature signaling
+    # such as Action Mode, Dual Camera, GPS track. Copy them as-is to preserve
+    # iOS Photos feature badges without re-encoding.
+    meta_stream_indices = []
+    for s in probe_data.get("streams", []):
+        if s.get("codec_type") in ("data", "tmcd"):
+            handler = s.get("tags", {}).get("handler_name", "")
+            tag = s.get("codec_tag_string", "")
+            # mebx = CoreMedia timed metadata; tmcd = timecode
+            if tag in ("mebx", "tmcd") or any(h in handler for h in _META_HANDLER_TAGS):
+                meta_stream_indices.append(s["index"])
+
+    cmd = [FFMPEG_BIN, "-noautorotate"] + _hwaccel_args(real_enc) + ["-i", str(src), "-map", "0:v:0"]
 
     if not mute and audio_streams:
         audio_map = (f"0:a:{best_audio_idx}"
                      if len(audio_streams) > 1 else "0:a:0")
         cmd += ["-map", audio_map]
 
+    for idx in meta_stream_indices:
+        cmd += ["-map", f"0:{idx}"]
+
     cmd += ["-c:v", real_enc]
     cmd += _quality_args(enc, crf)
     cmd += enc_extra
+    cmd += x265_params
 
     if family == "h265" and out_ext in (".mp4", ".mov", ".m4v"):
         cmd += ["-tag:v", "hvc1"]
+
+    if meta_stream_indices:
+        cmd += ["-c:d", "copy"]
 
     target_kbps = 192
     if not mute and audio_streams:
@@ -1818,18 +2914,29 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
             job["status"]  = "waiting"
             job["message"] = "Waiting in queue..."
         with _pick_sem(real_enc):
-            if job.get("cancelled"): return
+            with _jobs_lock:
+                if job.get("cancelled"): return
+            t0 = time.time()
+            # Rebuild x265 thread limits now (after queue wait) so free_ram_mb()
+            # reflects the actual pressure from other running jobs.
+            if _is_x265:
+                x265_params = _build_x265_params(video_w, video_h)
             with _jobs_lock:
                 job["status"]  = "processing"
-                job["message"] = f"Encoding ({real_enc}){av1_warning}{' — no audio' if mute else ''}..."
-            t0 = time.time()
+                crf_note = f" — CRF {crf} (Auto)" if crf_auto else ""
+                job["message"] = f"Encoding ({real_enc}){crf_note}{av1_warning}{' — no audio' if mute else ''}..."
+                job["encode_start_time"] = t0
             try:
                 if use_dovi:
                     rc, is_oom = _compress_dovi_pipeline(
                         job_id, src, dst, enc, real_enc, enc_extra, crf,
-                        mute, best_audio_idx, target_kbps, total_s, ppath, fps_str)
+                        mute, best_audio_idx, target_kbps, total_s, ppath,
+                        meta_stream_indices, x265_params=x265_params)
                 else:
-                    rc, is_oom = _run_progress(cmd, job_id, total_s, ppath)
+                    final_cmd = cmd.copy()
+                    if _is_x265 and x265_params:
+                        final_cmd = final_cmd[:-1] + x265_params + [final_cmd[-1]]
+                    rc, is_oom = _run_progress(final_cmd, job_id, total_s, ppath)
             except Exception as e:
                 rc = -1
                 is_oom = False
@@ -1842,7 +2949,8 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
                 break
 
         if rc != 0 and is_oom:
-            if job.get("cancelled"): return
+            with _jobs_lock:
+                if job.get("cancelled"): return
             oom_retries += 1
             if oom_retries >= 3:
                 if use_dovi:
@@ -1857,20 +2965,29 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
                     time.sleep(2)
                 else:
                     with _jobs_lock:
-                        job.update({"status": "error", "message": "Insufficient VRAM — failed after 3 retries."})
+                        job.update({"status": "error", "message": "Insufficient RAM — failed after 3 retries. Too many 4K jobs running at once."})
                     try: dst.unlink()
                     except: pass
                     return
             else:
                 with _jobs_lock:
+                    if job.get("cancelled"): return
+                    # Distinguish GPU VRAM exhaustion from CPU RAM exhaustion
+                    ram_msg = "RAM" if real_enc in ("libx265", "libx264", "libsvtav1", "libaom-av1") else "GPU"
                     job["status"]  = "waiting"
-                    job["message"] = f"GPU full, retrying ({oom_retries}/3)..."
+                    job["message"] = f"{ram_msg} full, retrying ({oom_retries}/3)..."
                 time.sleep(3)
+                with _jobs_lock:
+                    if job.get("cancelled"): return
 
     ok = rc == 0 and dst.exists() and dst.stat().st_size > 1024
 
     if ok:
-        _sync_meta(str(src), str(dst))
+        # _fix_mebx_tracks already runs inside _compress_dovi_pipeline (step 8)
+        # for DV videos, so skip the redundant second pass.
+        if meta_stream_indices and not use_dovi:
+            _fix_mebx_tracks(str(dst))
+        _sync_meta(str(src), str(dst), src_rotation)
 
         dst_exif = _get_exif_snapshot(str(dst))
         with _jobs_lock:
@@ -1892,15 +3009,7 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
         for s in out_data.get("streams", []):
             if s.get("codec_type") == "video":
                 w, h = s.get('width', '?'), s.get('height', '?')
-                rotation = 0
-                if "rotate" in s.get("tags", {}):
-                    try: rotation = abs(int(s["tags"]["rotate"]))
-                    except: pass
-                else:
-                    for sd in s.get("side_data_list", []):
-                        if sd.get("side_data_type") == "Display Matrix":
-                            try: rotation = abs(int(sd.get("rotation", 0)))
-                            except: pass
+                rotation = _get_rotation(s)
                 if rotation in (90, 270) and w != '?' and h != '?':
                     out_res = f"{h}x{w}"
                 else:
@@ -1963,6 +3072,267 @@ def _compress_job(job_id, src: Path, enc: str, crf: int,
         try: dst.unlink()
         except: pass
 
+    try: src.unlink()
+    except: pass
+    try: os.unlink(ppath)   # no-op if _run_progress already cleaned it
+    except: pass
+
+===== FILE: app/workers/social.py =====
+import os, re, time, tempfile, subprocess
+from pathlib import Path
+from app.jobs import jobs, _jobs_lock
+from app.config import FFMPEG_BIN, EXIFTOOL_BIN, OUTPUT_DIR
+from app.utils import _probe, _fmt_size, _fmt_time, _duration, _sync_meta, _unique_output_path
+from app.encoder import _quality_args, _hwaccel_args, _pick_sem, get_gpu_info, light_semaphore
+from app.workers import job_guard, _run_progress, _check_path_len_job
+
+
+@job_guard
+def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
+    job = jobs[job_id]
+
+    stem = re.sub(r"[^\w\-. ]", "_", src.stem)
+    dst  = _unique_output_path(f"{stem}_{preset_key}", ".mp4")
+
+    if not _check_path_len_job(dst, job_id):
+        try: dst.unlink()
+        except: pass
+        try: src.unlink()
+        except: pass
+        return
+
+    total_s = _duration(str(src))
+
+    filters = []
+    scale, fps = preset.get("scale"), preset.get("fps")
+    if scale == "9:16":
+        filters.append(
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
+        )
+    elif scale == "1080":
+        filters.append("scale=1080:-2,format=yuv420p")
+    if fps:
+        filters.append(f"fps={fps}")
+
+    enc = preset["encoder"]
+    gpu, _, _ = get_gpu_info()
+    gpu_map = {
+        "libx264": ["h264_nvenc","h264_amf"],
+        "libx265": ["hevc_nvenc","hevc_amf"],
+    }
+    for gpu_enc in gpu_map.get(enc, []):
+        if gpu_enc in gpu:
+            enc = gpu_enc
+            break
+
+    crf = preset["crf"]
+
+    pfd, ppath = tempfile.mkstemp(suffix=".txt"); os.close(pfd)
+
+    cmd = [FFMPEG_BIN] + (_hwaccel_args(enc) if not filters else []) + ["-i", str(src)]
+    if filters: cmd += ["-vf", ",".join(filters)]
+    cmd += ["-c:v", enc] + _quality_args(enc, crf)
+    if "265" in enc or "hevc" in enc: cmd += ["-tag:v","hvc1"]
+    ab   = preset["audio"]
+    cmd += [
+        "-c:a", "aac",
+        "-b:a", ab,
+        "-ar",  "48000",
+        "-ac",  "2",
+        "-map_metadata","0",
+        "-movflags","use_metadata_tags+faststart",
+        "-y","-progress",ppath,"-stats_period","0.5","-nostats", str(dst)
+    ]
+
+    oom_retries = 0
+    while True:
+        with _jobs_lock:
+            job["status"] = "waiting"
+            job["message"] = "Waiting in queue..."
+
+        t0 = None
+        with _pick_sem(enc):
+            with _jobs_lock:
+                if job.get("cancelled"): return
+                job["status"] = "processing"
+                job["message"] = f"Encoding ({enc})..."
+            t0 = time.time()
+            try:
+                rc, is_oom = _run_progress(cmd, job_id, total_s, ppath)
+            except Exception as e:
+                rc = -1
+                is_oom = False
+                with _jobs_lock:
+                    job.update({"status": "error", "message": f"Error: {e}"})
+
+            if rc != 0 and is_oom:
+                pass
+            else:
+                break
+
+        if rc != 0 and is_oom:
+            with _jobs_lock:
+                if job.get("cancelled"): return
+            oom_retries += 1
+            ram_msg = "RAM" if enc in ("libx265", "libx264", "libsvtav1", "libaom-av1") else "VRAM"
+            if oom_retries >= 3:
+                with _jobs_lock:
+                    job.update({"status": "error", "message": f"Insufficient {ram_msg} — failed after 3 retries."})
+                try: dst.unlink()
+                except: pass
+                return
+            with _jobs_lock:
+                gpu_msg = "RAM" if enc in ("libx265", "libx264", "libsvtav1", "libaom-av1") else "GPU"
+                job["status"] = "waiting"
+                job["message"] = f"{gpu_msg} full, retrying ({oom_retries}/3)..."
+            time.sleep(3)
+            with _jobs_lock:
+                if job.get("cancelled"): return
+
+    ok = rc == 0 and dst.exists() and dst.stat().st_size > 1024
+    ela      = time.time() - t0 if t0 else 0
+    enc_time = _fmt_time(ela)
+
+    if ok:
+        _sync_meta(str(src), str(dst))
+
+        out_data  = _probe(str(dst))
+        out_res   = out_fps = out_audio = "N/A"
+        for s in out_data.get("streams", []):
+            if s.get("codec_type") == "video":
+                out_res = f"{s.get('width','?')}x{s.get('height','?')}"
+                r = s.get("r_frame_rate", "0/1")
+                if "/" in r:
+                    n, d2 = r.split("/")
+                    if int(d2): out_fps = f"{round(int(n)/int(d2),1)} fps"
+                break
+        for s in out_data.get("streams", []):
+            if s.get("codec_type") == "audio":
+                ac = s.get("codec_name", "N/A").upper()
+                out_audio = f"{ac}"
+                break
+
+        with _jobs_lock:
+            job.update({
+                "status":"done","progress":100,"message":"Completed!",
+                "output":str(dst),
+                "sz_before":_fmt_size(str(src)),
+                "sz_after": _fmt_size(str(dst)),
+                "encode_time": enc_time,
+                "out_res": out_res,
+                "out_fps": out_fps,
+                "out_audio": out_audio,
+                "out_enc": preset.get("label", "Preset")
+            })
+    else:
+        with _jobs_lock:
+            job.update({"status":"error","message":"Export failed!"})
+        try: dst.unlink()
+        except: pass
+    try: src.unlink()
+    except: pass
+    try: Path(ppath).unlink()
+    except: pass
+
+
+@job_guard
+def _social_photo_job(job_id, src: Path, preset: dict, preset_key: str):
+    job = jobs[job_id]
+
+    stem = re.sub(r"[^\w\-. ]", "_", src.stem)
+    dst  = _unique_output_path(f"{stem}_{preset_key}", ".jpg")
+
+    if not _check_path_len_job(dst, job_id):
+        try: dst.unlink()
+        except: pass
+        try: src.unlink()
+        except: pass
+        return
+
+    tw, th = preset["w"], preset["h"]
+    fit    = preset.get("fit","contain")
+
+    if fit == "contain":
+        vf = (
+            f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+            f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"colorspace=all=bt709:iall=bt709,"
+            f"format=yuvj420p"
+        )
+    else:
+        vf = (
+            f"scale={tw}:{th}:force_original_aspect_ratio=increase,"
+            f"crop={tw}:{th},"
+            f"colorspace=all=bt709:iall=bt709,"
+            f"format=yuvj420p"
+        )
+
+    q   = max(1, int((100 - preset["q"]) / 100 * 31))
+    cmd = [FFMPEG_BIN,"-i",str(src),"-vf",vf,"-q:v",str(q),"-frames:v","1","-y",str(dst)]
+    with _jobs_lock:
+        job["status"] = "waiting"
+        job["message"] = "Waiting in queue..."
+    with light_semaphore:
+        with _jobs_lock:
+            if job.get("cancelled"): return
+            job["status"] = "processing"
+            job["message"] = f"Exporting image..."
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=300)
+            rc = r.returncode
+        except subprocess.TimeoutExpired:
+            rc = -1
+            with _jobs_lock:
+                job.update({"status": "error", "message": "Photo export timeout (5min)"})
+        except Exception as e:
+            rc = -1
+            with _jobs_lock:
+                job.update({"status": "error", "message": f"Error: {e}"})
+    ok  = rc == 0 and dst.exists() and dst.stat().st_size > 1024
+
+    if ok:
+        if EXIFTOOL_BIN:
+            try:
+                subprocess.run([
+                    EXIFTOOL_BIN,
+                    "-api","LargeFileSupport=1",
+                    "-tagsfromfile", str(src),
+                    "-GPSLatitude","-GPSLongitude","-GPSAltitude",
+                    "-GPSLatitudeRef","-GPSLongitudeRef",
+                    "-DateTimeOriginal","-CreateDate",
+                    "-Make","-Model","-LensModel",
+                    "--FileModifyDate","--FileCreateDate",
+                    "-overwrite_original", str(dst)
+                ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+            except subprocess.TimeoutExpired:
+                pass
+
+        out_data  = _probe(str(dst))
+        out_res   = "N/A"
+        for s in out_data.get("streams", []):
+            if s.get("codec_type") == "video":
+                out_res = f"{s.get('width','?')}x{s.get('height','?')}"
+                break
+
+        with _jobs_lock:
+            job.update({
+                "status":"done","progress":100,"message":"Completed!",
+                "output":str(dst),
+                "sz_before":_fmt_size(str(src)),
+                "sz_after": _fmt_size(str(dst)),
+                "encode_time": "N/A",
+                "out_res": out_res,
+                "out_fps": "N/A",
+                "out_audio": "N/A",
+                "out_enc": preset.get("label", "Preset")
+            })
+    else:
+        with _jobs_lock:
+            job.update({"status":"error","message":"Photo export failed!"})
+        try: dst.unlink()
+        except: pass
     try: src.unlink()
     except: pass
 
