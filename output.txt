@@ -1,338 +1,16 @@
 PROJECT TREE
 ============
 
-│   ├── app/
-│   │   ├── encoder.py
-│   │   ├── utils.py
-│   │   ├── static/
-│   │   │   ├── js/
-│   │   │   │   ├── state.js
-│   │   ├── templates/
-│   │   │   ├── index.html
-│   │   ├── workers/
-│   │   │   ├── compress.py
-│   │   │   ├── social.py
+│   ├── utils.py
+│   ├── routes/
+│   │   ├── files.py
+│   ├── static/
+│   │   ├── js/
+│   │   │   ├── main.js
 
 
-===== FILE: app/encoder.py =====
-import subprocess, threading, time, os
-from app.config import FFMPEG_BIN, _cpu_cores, _cpu_h_slots, _GPU_ENCS, _CPU_AV1_ENCS
-from app.platform_utils import free_ram_mb
-
-
-class _AdaptiveCPUSemaphore:
-    """
-    Limits CPU-encoder job parallelism based on:
-    1. Hard slot count (max concurrent jobs)
-    2. Free system RAM (must keep > keep_ram_mb free before starting a new job)
-
-    libx265 encoding 4K 10-bit 4:2:2 needs ~3 GB RAM per instance.
-    Without this guard, a batch of 4K files causes concurrent malloc failures
-    and "memory allocation failure, aborting encode" from x265.
-    """
-    def __init__(self, max_slots: int, keep_ram_mb: int = 2500):
-        self._max        = max_slots
-        self._keep_ram   = keep_ram_mb
-        self._lock       = threading.Lock()
-        self._count      = 0
-        self._last_acq   = 0.0
-
-    def acquire(self):
-        first = True
-        while True:
-            if not first:
-                time.sleep(2.0)
-            first = False
-            # Stagger concurrent acquires by 0.5 s to avoid thundering-herd
-            with self._lock:
-                elapsed = time.time() - self._last_acq
-            if elapsed < 0.5:
-                time.sleep(0.5 - elapsed)
-            with self._lock:
-                if self._count < self._max and free_ram_mb() > self._keep_ram:
-                    self._count += 1
-                    self._last_acq = time.time()
-                    return
-
-    def release(self):
-        with self._lock:
-            self._count = max(0, self._count - 1)
-
-    def __enter__(self):    self.acquire()
-    def __exit__(self, *_): self.release()
-
-class _AdaptiveGPUSemaphore:
-    """
-    Limits GPU job parallelism based on:
-    1. Hard slot count (max concurrent jobs)
-    2. Free VRAM (> 10% total VRAM)
-    3. System RAM (> 2GB reserved)
-    """
-    def __init__(self, max_slots=4, keep_vram_pct=0.10):
-        self._max          = max_slots
-        self._keep_vram_pct = keep_vram_pct
-        self._lock         = threading.Lock()
-        self._count        = 0
-        self._last_acquire = 0.0
-
-    def _vram_stats(self):
-        try:
-            r = subprocess.run(
-                ["nvidia-smi",
-                 "--query-gpu=memory.free,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2
-            )
-            if r.returncode == 0:
-                free_l, total_l = [], []
-                for line in r.stdout.strip().splitlines():
-                    parts = line.split(',')
-                    if len(parts) >= 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
-                        free_l.append(int(parts[0].strip()))
-                        total_l.append(int(parts[1].strip()))
-                if free_l and total_l:
-                    return min(free_l), min(total_l)
-        except Exception:
-            pass
-        return None, None
-
-    def acquire(self):
-        first = True
-        while True:
-            if not first:
-                time.sleep(1.5)
-            first = False
-            with self._lock:
-                elapsed = time.time() - self._last_acquire
-            if elapsed < 0.5:
-                time.sleep(0.5 - elapsed)
-
-            vram_free, vram_total = self._vram_stats()
-
-            with self._lock:
-                req_vram  = vram_total * self._keep_vram_pct if vram_total else 800
-                has_vram  = vram_free is None or vram_free > req_vram
-                has_sys_ram = free_ram_mb() > 2000
-
-                if self._count < self._max and has_vram and has_sys_ram:
-                    self._count += 1
-                    self._last_acquire = time.time()
-                    return
-
-    def release(self):
-        with self._lock:
-            self._count = max(0, self._count - 1)
-
-    def __enter__(self):    self.acquire()
-    def __exit__(self, *_): self.release()
-
-
-def _auto_gpu_slots(vram_per_job_mb: int = 1800, min_slots: int = 1, max_slots: int = 8) -> int:
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2
-        )
-        if r.returncode == 0:
-            totals = [int(x.strip()) for x in r.stdout.strip().splitlines() if x.strip().isdigit()]
-            if totals:
-                total_mb   = min(totals)
-                usable_mb  = int(total_mb * 0.85)
-                slots      = max(min_slots, min(max_slots, usable_mb // vram_per_job_mb))
-                print(f"  GPU VRAM detected: {total_mb} MB → {slots} concurrent encode slots")
-                return slots
-    except Exception:
-        pass
-    print("  GPU VRAM: cannot read, using default 2 slots")
-    return 2
-
-
-_gpu_slots        = _auto_gpu_slots()
-gpu_semaphore     = _AdaptiveGPUSemaphore(max_slots=_gpu_slots)
-cpu_h_semaphore   = threading.Semaphore(_cpu_h_slots)
-cpu_av1_semaphore = threading.Semaphore(1)
-light_semaphore   = threading.Semaphore(2)
-
-
-def _pick_sem(enc: str):
-    if enc in _GPU_ENCS:     return gpu_semaphore
-    if enc in _CPU_AV1_ENCS: return cpu_av1_semaphore
-    return cpu_h_semaphore
-
-
-def _test_enc(codec):
-    if not FFMPEG_BIN: return False
-    r = subprocess.run(
-        [FFMPEG_BIN,
-         "-f", "lavfi", "-i", "nullsrc=s=256x256",
-         "-t", "0.1",
-         "-pix_fmt", "yuv420p",
-         "-c:v", codec,
-         "-f", "null", "-"],
-        capture_output=True, text=True, timeout=10
-    )
-    return r.returncode == 0
-
-
-def _detect_gpu() -> dict:
-    candidates = [
-        ("av1_nvenc",  "NVIDIA", "AV1"),
-        ("av1_amf",    "AMD",    "AV1"),
-        ("av1_qsv",    "Intel",  "AV1"),
-        ("hevc_nvenc", "NVIDIA", "H.265"),
-        ("hevc_amf",   "AMD",    "H.265"),
-        ("hevc_qsv",   "Intel",  "H.265"),
-        ("h264_nvenc", "NVIDIA", "H.264"),
-        ("h264_amf",   "AMD",    "H.264"),
-        ("h264_qsv",   "Intel",  "H.264"),
-    ]
-    found, seen = {}, set()
-    for codec, vendor, fmt in candidates:
-        key = (vendor, fmt)
-        if key not in seen and _test_enc(codec):
-            seen.add(key)
-            found[codec] = {"vendor": vendor, "format": fmt}
-    return found
-
-
-GLOBAL_GPU_INFO     = None
-GLOBAL_DEFAULT_ENC  = None
-GLOBAL_ENC_GROUPS   = None
-
-
-def get_gpu_info():
-    global GLOBAL_GPU_INFO, GLOBAL_DEFAULT_ENC, GLOBAL_ENC_GROUPS
-    if GLOBAL_GPU_INFO is None:
-        GLOBAL_GPU_INFO    = _detect_gpu()
-        GLOBAL_DEFAULT_ENC = _get_default_encoder(GLOBAL_GPU_INFO)
-        GLOBAL_ENC_GROUPS  = _build_encoder_options(GLOBAL_GPU_INFO)
-    return GLOBAL_GPU_INFO, GLOBAL_DEFAULT_ENC, GLOBAL_ENC_GROUPS
-
-
-def _get_default_encoder(gpu: dict) -> str:
-    for enc in ["av1_nvenc", "av1_amf"]:
-        if enc in gpu: return enc
-    for enc in ["hevc_nvenc", "hevc_amf"]:
-        if enc in gpu: return enc
-    return "libx265"
-
-
-def _build_encoder_options(gpu: dict) -> list:
-    groups = []
-
-    for codec, info in gpu.items():
-        if info["format"] == "AV1" and "qsv" not in codec:
-            groups.append({
-                "group":   f"<i data-lucide=\"rocket\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> {info['vendor']} GPU — AV1",
-                "warning": False,
-                "encoders": [{"codec": codec,
-                    "label": f"{info['vendor']} AV1 — Fastest + smallest"}]
-            })
-
-    for codec, info in gpu.items():
-        if info["format"] == "H.265" and "qsv" not in codec:
-            groups.append({
-                "group":   f"<i data-lucide=\"rocket\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> {info['vendor']} GPU — H.265",
-                "warning": False,
-                "encoders": [{"codec": codec,
-                    "label": f"{info['vendor']} H.265 — Fast, low CPU usage <i data-lucide=\"star\" style=\"width:14px;height:14px;vertical-align:-2px;color:var(--yellow)\"></i>"}]
-            })
-
-    groups.append({
-        "group":   "<i data-lucide=\"cpu\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> CPU",
-        "warning": False,
-        "encoders": [
-            {"codec": "libx265",
-             "label": "H.265 / HEVC — Recommended <i data-lucide=\"check-circle-2\" style=\"width:16px;height:16px;vertical-align:-2px;color:var(--green)\"></i>"},
-            {"codec": "libx264",
-             "label": "H.264 — Highest compatibility"},
-        ]
-    })
-
-    av1_enc = []
-    if _test_enc("libsvtav1"):
-        av1_enc += [
-            {"codec": "libsvtav1",
-             "label": "SVT-AV1 preset 6 — ~25% smaller than H.265"},
-            {"codec": "libsvtav1_p4",
-             "label": "SVT-AV1 preset 4 — Higher quality, slower"},
-        ]
-    av1_enc.append({"codec": "libaom-av1", "label": "libaom-AV1 — Slowest"})
-    groups.append({
-        "group":   "<i data-lucide=\"cpu\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> CPU — AV1 (smaller than H.265, slower)",
-        "warning": False,
-        "encoders": av1_enc
-    })
-
-    for codec, info in gpu.items():
-        if info["format"] == "H.264" and "qsv" not in codec:
-            groups.append({
-                "group":   f"<i data-lucide=\"rocket\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> {info['vendor']} GPU — H.264",
-                "warning": False,
-                "encoders": [{"codec": codec,
-                    "label": f"{info['vendor']} H.264"}]
-            })
-
-    has_discrete_gpu = any("qsv" not in c for c in gpu)
-    if not has_discrete_gpu:
-        qsv_encs = [
-            {"codec": c,
-             "label": f"Intel QSV {i['format']} — Faster than CPU"}
-            for c, i in gpu.items() if "qsv" in c
-        ]
-        if qsv_encs:
-            groups.append({
-                "group":   "<i data-lucide=\"zap\" style=\"width:16px;height:16px;vertical-align:-2px\"></i> Intel QSV — Faster than CPU, lower quality",
-                "warning": True,
-                "encoders": qsv_encs
-            })
-
-    return groups
-
-
-def _get_codec_family(enc: str) -> str:
-    if "av1"  in enc: return "av1"
-    if "265"  in enc or "hevc" in enc: return "h265"
-    return "h264"
-
-
-def _get_real_enc_extra(enc: str) -> tuple:
-    # film-grain=6: SVT-AV1 analyses source grain, denoises, re-synthesises at decode.
-    # On clean video: no grain detected → no synthesis → safe. On iPhone footage: 20-30% smaller.
-    _svtav1_fg = f"lp={_cpu_cores}:film-grain=6:film-grain-denoise=1"
-    if enc == "libsvtav1_p4": return "libsvtav1", ["-preset","4","-svtav1-params",_svtav1_fg]
-    if enc == "libsvtav1":    return "libsvtav1", ["-preset","6","-svtav1-params",_svtav1_fg]
-    if enc in ("libx265", "libx264"):
-        return enc, ["-preset", "medium"]
-    if enc == "libaom-av1":
-        return enc, ["-cpu-used","6","-row-mt","1","-tiles","4x4"]
-    return enc, []
-
-
-def _quality_args(enc: str, crf: int) -> list:
-    # h264/hevc nvenc: uncapped VBR + HQ tune + Adaptive Quantization.
-    # av1_nvenc: -tune hq already enables AQ; -spatial_aq/-temporal_aq not supported on AV1 NVENC.
-    if enc in ("h264_nvenc","hevc_nvenc"):
-        return ["-rc","vbr","-cq",str(crf),"-b:v","0",
-                "-tune","hq","-spatial_aq","1","-temporal_aq","1","-aq-strength","15"]
-    if enc == "av1_nvenc":
-        return ["-rc","vbr","-cq",str(crf),"-b:v","0","-tune","hq"]
-    if enc in ("h264_amf","hevc_amf"):
-        return ["-rc","cqp","-qp",str(crf)]
-    if enc == "av1_amf":
-        return ["-rc","qvbr","-qvbr_quality_level",str(crf)]
-    if enc in ("h264_qsv","hevc_qsv","av1_qsv"):
-        return ["-global_quality",str(crf),"-look_ahead","1","-b:v","0"]
-    return ["-crf",str(crf),"-b:v","0"]
-
-
-def _hwaccel_args(enc: str) -> list:
-    if enc in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
-        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-    return []
-
-===== FILE: app/utils.py =====
-import os, re, json, struct, subprocess, datetime, threading, shutil
+===== FILE: utils.py =====
+import os, re, json, struct, subprocess, datetime, threading, shutil, mmap
 from pathlib import Path
 from app.config import (
     FFPROBE_BIN, EXIFTOOL_BIN, UPLOAD_DIR, OUTPUT_DIR,
@@ -1205,58 +883,84 @@ def _get_exif_snapshot(path) -> dict:
 
 # ── Dolby Vision: Annex-B parser + timestamp-preserving mux ──────────────────
 
-def _annexb_to_mp4_samples(hevc_path: str) -> list:
+def _annexb_iter(hevc_path: str):
     """
-    Parse dovi_tool inject-rpu Annex-B output into per-frame MP4 samples.
-    Each sample = concatenation of 4-byte-BE-length-prefixed NAL units.
-    Frames are delimited by AUD NAL units (HEVC type 35) which dovi_tool adds
-    by default between every frame.
-    Returns [] on error.
+    Generator: yield one MP4-format sample (bytes) per frame from an Annex-B HEVC file.
+    Uses mmap so the OS pages data on demand — only one frame's NAL units are in RAM
+    at a time (peak ≈ a few MB regardless of file size).
+    AUD NAL units (type 35) delimit frame boundaries.
     """
     try:
-        with open(hevc_path, 'rb') as f:
-            raw = f.read()
+        file_size = os.path.getsize(hevc_path)
+        if file_size == 0:
+            return
+        f = open(hevc_path, 'rb')
     except OSError:
-        return []
+        return
 
-    total = len(raw)
-    # ── find all start codes (00 00 01 or 00 00 00 01) ──────────────────────
-    sc_pos = []   # (first_byte_after_sc, sc_length)
-    i = 0
-    while i < total - 2:
-        if raw[i] == 0 and raw[i + 1] == 0:
-            if i + 3 < total and raw[i + 2] == 0 and raw[i + 3] == 1:
-                sc_pos.append((i + 4, 4)); i += 4; continue
-            if raw[i + 2] == 1:
-                sc_pos.append((i + 3, 3)); i += 3; continue
-        i += 1
+    try:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            total = len(mm)
+            cur = []  # length-prefixed NAL units for the current frame
 
-    if not sc_pos:
-        return []
+            def _next_sc(start):
+                """Return (sc_start, nal_start) for the next start code, or (total, total)."""
+                p = mm.find(b'\x00\x00\x01', start)
+                if p < 0:
+                    return total, total
+                if p > 0 and mm[p - 1] == 0:
+                    return p - 1, p + 3
+                return p, p + 3
 
-    # ── extract NAL unit data for each SC position ───────────────────────────
-    nals = []   # (nal_type, nal_bytes)
-    for idx, (nal_start, sc_len) in enumerate(sc_pos):
-        nal_end = sc_pos[idx + 1][0] - sc_pos[idx + 1][1] if idx + 1 < len(sc_pos) else total
-        nal = raw[nal_start:nal_end]
-        # nal_end already points to the byte before the next start code
-        if nal:
-            nals.append(((nal[0] >> 1) & 0x3F, nal))
-
-    # ── group by AUD (type 35) → one MP4 sample per frame ───────────────────
-    samples, cur = [], []
-    for nal_type, nal in nals:
-        if nal_type == 35:                     # AUD: signals start of new AU
+            _, nal_start = _next_sc(0)
+            while nal_start < total:
+                next_sc, next_nal = _next_sc(nal_start)
+                nal = bytes(mm[nal_start:next_sc])
+                if nal:
+                    nal_type = (nal[0] >> 1) & 0x3F
+                    if nal_type == 35:  # AUD: frame boundary
+                        if cur:
+                            yield b''.join(cur)
+                            cur = []
+                    else:
+                        cur.append(struct.pack('>I', len(nal)) + nal)
+                nal_start = next_nal
             if cur:
-                samples.append(b''.join(struct.pack('>I', len(nd)) + nd
-                                        for _, nd in cur))
-                cur = []
-        else:
-            cur.append((nal_type, nal))
-    if cur:
-        samples.append(b''.join(struct.pack('>I', len(nd)) + nd for _, nd in cur))
+                yield b''.join(cur)
+    finally:
+        f.close()
 
-    return samples
+
+def _read_before_mdat(path: str):
+    """
+    Read all top-level boxes before mdat into a bytearray — does NOT load mdat body.
+    Returns (buf: bytearray, mdat_start: int) where mdat_start = len(buf) = file offset of mdat.
+    With -movflags faststart, moov precedes mdat, so buf contains ftyp + moov (typically 5–50 MB).
+    """
+    buf = bytearray()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                box_sz = struct.unpack_from('>I', hdr)[0]
+                fc = hdr[4:8]
+                extra = b''
+                if box_sz == 1:  # extended 64-bit size
+                    extra = f.read(8)
+                    if len(extra) < 8:
+                        break
+                    box_sz = struct.unpack_from('>Q', extra)[0]
+                body_sz = box_sz - 8 - len(extra)
+                if body_sz < 0:
+                    break
+                if fc == b'mdat':
+                    return buf, len(buf)
+                buf += hdr + extra + f.read(body_sz)
+    except OSError:
+        pass
+    return buf, len(buf)
 
 
 def _mp4_walk_top(buf, start: int, end: int):
@@ -1362,140 +1066,129 @@ def _stsc_samples_per_chunk(stsc: list, n_chunks: int) -> list:
     return result
 
 
-def _dovi_mux_with_timestamps(base_mov: str, dv_samples: list, dst: str) -> bool:
+def _dovi_mux_streaming(base_mov: str, dv_hevc: str, dst: str) -> bool:
     """
-    Rebuild a MOV file that has:
-      • Video bitstream data from dv_samples  (MP4-format, one bytes per frame)
-      • Video timestamps (stts/ctts/stss)     preserved from base_mov's video trak
-      • Audio data and timing                 preserved from base_mov's audio trak
+    Streaming replacement for the old _annexb_to_mp4_samples + _dovi_mux_with_timestamps pair.
 
-    Strategy: the stsz and stco boxes have the same NUMBER of entries before and
-    after RPU injection (same frame count, same chunk count), so their box SIZE
-    does not change. We can therefore patch them in-place inside the bytearray
-    copy of base_mov, then replace the mdat section with new video + audio data.
+    Peak RAM: O(moov_size + one_frame_size) ≈ 10–50 MB regardless of video length.
 
-    Returns True on success.
+    Two passes over dv_hevc (both via _annexb_iter / mmap):
+      Pass 1: collect per-frame sample sizes → compute new stsz/stco values.
+      Pass 2: stream samples directly to the output file (no full buffer in RAM).
+
+    Audio is streamed chunk-by-chunk from base_mov using the original stco offsets.
     """
-    try:
-        with open(base_mov, 'rb') as f:
-            buf = bytearray(f.read())
-    except OSError:
+    # ── Load ftyp + moov only (stop before mdat) ─────────────────────────────
+    buf, mdat_start = _read_before_mdat(base_mov)
+    if not buf:
         return False
 
-    # ── locate top-level boxes (ftyp, moov, mdat) ────────────────────────────
-    moov_s = moov_e = mdat_s = mdat_e = -1
+    moov_s = -1
     for fc, ds, be in _mp4_walk_top(buf, 0, len(buf)):
-        if fc == b'moov': moov_s, moov_e = ds - 8, be
-        elif fc == b'mdat': mdat_s, mdat_e = ds - 8, be
-    if moov_s < 0 or mdat_s < 0:
+        if fc == b'moov':
+            moov_s, moov_e = ds - 8, be
+            break
+    if moov_s < 0:
         return False
 
-    moov_body_s = moov_s + 8
-    moov_body_e = moov_e
+    mb_s, mb_e = moov_s + 8, moov_e
 
-    # ── locate video track stbl entries ──────────────────────────────────────
-    vs_s, vs_e = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'vide', b'stsz')
-    vc_s, vc_e = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'vide', b'stco')
-    vsc_s, _ = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'vide', b'stsc')
-    # also try co64
+    # ── Locate video stbl boxes ───────────────────────────────────────────────
+    vs_s, _  = _mp4_find_in_trak(buf, mb_s, mb_e, b'vide', b'stsz')
+    vc_s, _  = _mp4_find_in_trak(buf, mb_s, mb_e, b'vide', b'stco')
+    vsc_s, _ = _mp4_find_in_trak(buf, mb_s, mb_e, b'vide', b'stsc')
     if vc_s < 0:
-        vc_s, vc_e = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'vide', b'co64')
-
+        vc_s, _ = _mp4_find_in_trak(buf, mb_s, mb_e, b'vide', b'co64')
     if vs_s < 0 or vc_s < 0 or vsc_s < 0:
         return False
 
-    v_stsz = _parse_stsz_buf(buf, vs_s)
-    v_stco = _parse_stco_buf(buf, vc_s)
-    v_stsc = _parse_stsc_buf(buf, vsc_s)
-    n_video = len(v_stsz)
+    v_stsz   = _parse_stsz_buf(buf, vs_s)
+    v_stco   = _parse_stco_buf(buf, vc_s)
+    v_stsc   = _parse_stsc_buf(buf, vsc_s)
+    n_video  = len(v_stsz)
     n_chunks = len(v_stco)
 
-    # Safety: frame count must match
-    if len(dv_samples) != n_video:
-        # Trim to min; mild mismatch (off-by-one) is tolerable
-        min_n = min(len(dv_samples), n_video)
-        if abs(len(dv_samples) - n_video) > 2:
+    # ── Locate audio stbl boxes ───────────────────────────────────────────────
+    ac_s, _ = _mp4_find_in_trak(buf, mb_s, mb_e, b'soun', b'stco')
+    if ac_s < 0:
+        ac_s, _ = _mp4_find_in_trak(buf, mb_s, mb_e, b'soun', b'co64')
+    as_s,  _ = _mp4_find_in_trak(buf, mb_s, mb_e, b'soun', b'stsz')
+    asc_s, _ = _mp4_find_in_trak(buf, mb_s, mb_e, b'soun', b'stsc')
+    has_audio = (ac_s >= 0 and as_s >= 0 and asc_s >= 0)
+
+    a_stco = _parse_stco_buf(buf, ac_s) if has_audio else []
+    a_stsz = _parse_stsz_buf(buf, as_s) if has_audio else []
+    a_stsc = _parse_stsc_buf(buf, asc_s) if has_audio else []
+
+    # ── Pass 1: collect sample sizes (no data in RAM) ─────────────────────────
+    sample_sizes = [len(s) for s in _annexb_iter(dv_hevc)]
+    if not sample_sizes:
+        return False
+
+    # Tolerate off-by-one frame count between dovi_tool and FFmpeg output
+    if len(sample_sizes) != n_video:
+        min_n = min(len(sample_sizes), n_video)
+        if abs(len(sample_sizes) - n_video) > 2:
             return False
-        dv_samples = dv_samples[:min_n]
+        sample_sizes = sample_sizes[:min_n]
         n_video = min_n
 
-    new_sizes = [len(s) for s in dv_samples]
-
-    # ── build new video chunks grouped by stsc structure ─────────────────────
-    spc_list = _stsc_samples_per_chunk(v_stsc, n_chunks)
-    video_chunks = []
-    si = 0
-    for spc in spc_list:
-        chunk = b''.join(dv_samples[si + j] for j in range(spc)
-                         if si + j < len(dv_samples))
-        video_chunks.append(chunk)
-        si += spc
-
-    # ── collect audio chunks from the original mdat ───────────────────────────
-    audio_chunks = []
-    ac_s, _ = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'soun', b'stco')
-    if ac_s < 0:
-        ac_s, _ = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'soun', b'co64')
-    as_s, _ = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'soun', b'stsz')
-    asc_s, _ = _mp4_find_in_trak(buf, moov_body_s, moov_body_e, b'soun', b'stsc')
-
-    if ac_s >= 0 and as_s >= 0 and asc_s >= 0:
-        a_stco = _parse_stco_buf(buf, ac_s)
-        a_stsz = _parse_stsz_buf(buf, as_s)
-        a_stsc = _parse_stsc_buf(buf, asc_s)
+    # ── Compute audio chunk sizes ─────────────────────────────────────────────
+    audio_chunk_sizes = []
+    if has_audio:
         a_spc_list = _stsc_samples_per_chunk(a_stsc, len(a_stco))
         asi = 0
-        for ci, spc in enumerate(a_spc_list):
-            chunk_sz = sum(a_stsz[asi + j] for j in range(spc)
-                           if asi + j < len(a_stsz))
-            chunk_off = a_stco[ci]
-            if 0 < chunk_off < len(buf) and chunk_off + chunk_sz <= len(buf):
-                audio_chunks.append(buf[chunk_off: chunk_off + chunk_sz])
-            else:
-                audio_chunks.append(b'')   # safety fallback
+        for spc in a_spc_list:
+            audio_chunk_sizes.append(
+                sum(a_stsz[asi + j] for j in range(spc) if asi + j < len(a_stsz)))
             asi += spc
 
-    # ── compute new mdat layout ───────────────────────────────────────────────
-    # mdat position stays the same (moov size unchanged, since stsz/stco entries
-    # count is the same → box sizes unchanged → moov size unchanged).
-    new_mdat_off = mdat_s
-    new_mdat_body_s = new_mdat_off + 8         # after 8-byte mdat box header
+    # ── Determine mdat header size (handle mdat body > 4 GB) ─────────────────
+    total_mdat_body = sum(sample_sizes) + sum(audio_chunk_sizes)
+    if 8 + total_mdat_body >= 0x100000000:
+        mdat_hdr = struct.pack('>I', 1) + b'mdat' + struct.pack('>Q', 16 + total_mdat_body)
+        mdat_hdr_size = 16
+    else:
+        mdat_hdr = struct.pack('>I', 8 + total_mdat_body) + b'mdat'
+        mdat_hdr_size = 8
 
-    # video chunk offsets in new mdat
-    cur = new_mdat_body_s
+    # ── Compute new stco offsets ──────────────────────────────────────────────
+    new_body_start = mdat_start + mdat_hdr_size
+    spc_list = _stsc_samples_per_chunk(v_stsc, n_chunks)
+    cur = new_body_start
     new_v_stco = []
-    for chunk in video_chunks:
+    si = 0
+    for spc in spc_list:
         new_v_stco.append(cur)
-        cur += len(chunk)
+        for j in range(spc):
+            if si + j < n_video:
+                cur += sample_sizes[si + j]
+        si += spc
 
-    # audio chunk offsets in new mdat (sequentially after video)
     new_a_stco = []
-    for chunk in audio_chunks:
+    for chunk_sz in audio_chunk_sizes:
         new_a_stco.append(cur)
-        cur += len(chunk)
+        cur += chunk_sz
 
-    # ── patch video stsz entries in-place ────────────────────────────────────
-    # stsz fixed-size field is at vs_s+12; if 0 → variable-size (entries at vs_s+20+)
+    # ── Patch stsz entries in buf ─────────────────────────────────────────────
     old_fixed = struct.unpack_from('>I', buf, vs_s + 12)[0]
     if old_fixed == 0:
-        for i, sz_val in enumerate(new_sizes):
+        for i, sz_val in enumerate(sample_sizes):
             eoff = vs_s + 20 + i * 4
             if eoff + 4 <= len(buf):
                 struct.pack_into('>I', buf, eoff, sz_val)
-    elif len(set(new_sizes)) == 1 and new_sizes[0] == old_fixed:
-        pass                                   # fixed-size unchanged, nothing to do
-    else:
-        return False                           # can't patch fixed-size stsz in-place
+    elif not (len(set(sample_sizes)) == 1 and sample_sizes[0] == old_fixed):
+        return False  # fixed-size stsz can't be patched with variable sizes
 
-    # ── patch video stco entries in-place ─────────────────────────────────────
+    # ── Patch video stco entries in buf ───────────────────────────────────────
     is64_v = (bytes(buf[vc_s + 4: vc_s + 8]) == b'co64')
     entry_sz_v, fmt_v = (8, '>Q') if is64_v else (4, '>I')
     for i, off_val in enumerate(new_v_stco):
-        eoff = vc_s + 16 + i * entry_sz_v     # 8 hdr + 4 ver/flags + 4 count = 16
+        eoff = vc_s + 16 + i * entry_sz_v
         if eoff + entry_sz_v <= len(buf):
             struct.pack_into(fmt_v, buf, eoff, off_val)
 
-    # ── patch audio stco entries in-place ─────────────────────────────────────
+    # ── Patch audio stco entries in buf ───────────────────────────────────────
     if new_a_stco and ac_s >= 0:
         is64_a = (bytes(buf[ac_s + 4: ac_s + 8]) == b'co64')
         entry_sz_a, fmt_a = (8, '>Q') if is64_a else (4, '>I')
@@ -1504,24 +1197,41 @@ def _dovi_mux_with_timestamps(base_mov: str, dv_samples: list, dst: str) -> bool
             if eoff + entry_sz_a <= len(buf):
                 struct.pack_into(fmt_a, buf, eoff, off_val)
 
-    # ── build new mdat and write output ──────────────────────────────────────
-    new_mdat_body = b''.join(video_chunks) + b''.join(audio_chunks)
-    new_mdat = struct.pack('>I', 8 + len(new_mdat_body)) + b'mdat' + new_mdat_body
-
-    # Replace old mdat (and anything after it) with new mdat
-    new_buf = bytes(buf[:mdat_s]) + new_mdat
-
+    # ── Pass 2: write output streaming ────────────────────────────────────────
+    tmp_path = dst + '._dv_tmp'
     try:
-        tmp_path = dst + '._dv_tmp'
-        with open(tmp_path, 'wb') as f:
-            f.write(new_buf)
+        base_size = os.path.getsize(base_mov)
+        with open(tmp_path, 'wb') as out:
+            out.write(bytes(buf))   # patched ftyp + moov (5–50 MB)
+            out.write(mdat_hdr)
+
+            # Stream video samples from dv_hevc (one frame at a time)
+            written = 0
+            for sample in _annexb_iter(dv_hevc):
+                if written >= n_video:
+                    break
+                out.write(sample)
+                written += 1
+
+            # Stream audio chunks from base_mov using original stco offsets
+            if has_audio:
+                a_spc_list = _stsc_samples_per_chunk(a_stsc, len(a_stco))
+                asi = 0
+                with open(base_mov, 'rb') as src_f:
+                    for ci, spc in enumerate(a_spc_list):
+                        chunk_sz = sum(a_stsz[asi + j] for j in range(spc)
+                                       if asi + j < len(a_stsz))
+                        chunk_off = a_stco[ci]
+                        if 0 < chunk_off and chunk_off + chunk_sz <= base_size:
+                            src_f.seek(chunk_off)
+                            out.write(src_f.read(chunk_sz))
+                        asi += spc
+
         os.replace(tmp_path, dst)
         return True
     except OSError:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        try: os.unlink(tmp_path)
+        except Exception: pass
         return False
 
 
@@ -1703,1636 +1413,682 @@ def _unique_output_path(stem: str, ext: str, base_dir: Path = None) -> Path:
                 counter += 1
         raise RuntimeError(f"Cannot find unique output path for {stem!r}{ext} after 10000 attempts")
 
-===== FILE: app/static/js/state.js =====
-// state.js — shared mutable state
-
-export const S = {
-  compress: {
-    file: null, jobId: null, t0: null,
-    encLabel: '', crf: '24',
-    files: [], jobs: {}, batchId: null, batchStartTime: null,
-    server_file: null,
-  },
-  social: {
-    file: null, jobId: null, t0: null, server_file: null, done: false,
-  },
-  audio: {
-    file: null, jobId: null, t0: null, server_file: null, done: false,
-  },
-  download: {
-    jobId: null, t0: null, done: false, titles: [], out_dir: null,
-  },
-};
-
-export let socialVideoPreset = 'story_vertical';
-export let socialPhotoPreset = 'story';
-export let audioFmt          = 'mp3';
-export let socialFileType    = 'video';
-export let dlType            = 'video';
-export let dlBrowser         = 'none';
-export let crfPreset         = 'auto';
-export let crfValue          = 24;
-export let muteAudio         = false;
-export let preserveDv        = true;
-export let dlMode            = 'single';
-
-export function setSocialVideoPreset(v) { socialVideoPreset = v; }
-export function setSocialPhotoPreset(v) { socialPhotoPreset = v; }
-export function setAudioFmt(v)          { audioFmt = v; }
-export function setSocialFileType(v)    { socialFileType = v; }
-export function setDlType_(v)           { dlType = v; }
-export function setDlBrowser(v)         { dlBrowser = v; }
-export function setCrfPreset(v)         { crfPreset = v; }
-export function setCrfValue(v)          { crfValue = v; }
-export function setMuteAudio(v)         { muteAudio = v; }
-export function setPreserveDv(v)        { preserveDv = v; }
-export function setDlMode_(v)           { dlMode = v; }
-
-export const CRF_DEFAULTS = window.CRF_DEFAULTS;
-
-===== FILE: app/templates/index.html =====
-
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>VideoShrink Web</title>
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-  <script src="https://unpkg.com/lucide@latest"></script>
-</head>
-<body>
-<div class="wrap">
-
-  <div class="header" style="position: relative;">
-    <h1><img src="{{ url_for('static', filename='favicon.svg') }}" style="vertical-align: middle; margin-right: 10px; width: 36px; height: 36px; margin-top: -6px;"><span class="title-grad">VideoShrink</span></h1>
-    <p>Advanced Media Compressor & Downloader</p>
-  </div>
-
-  <div class="conn-box mb12">
-    <div class="conn-header" onclick="toggleConn()">
-      <div class="conn-header-left" style="font-size: 12px; font-weight: 600;">
-        <i data-lucide="globe" style="width:14px;height:14px;transform:translateY(-1px)"></i><span id="conn-title" style="text-transform: uppercase; letter-spacing: 1px;">SYSTEM DASHBOARD</span>
-      </div>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <div id="client-count-container" style="background: rgba(255,255,255,0.05); padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; color: var(--text-2); display:flex; align-items:center; gap:6px;">
-          <i data-lucide="monitor" style="width:14px;height:14px;vertical-align:middle"></i> <span id="dash-client-count">0 Clients</span>
-        </div>
-        <div id="server-status-item" style="background: rgba(255,255,255,0.05); padding: 4px 10px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; color: var(--text-3); display:flex; align-items:center; gap:6px;">
-          <span id="server-status-dot" class="status-dot" style="background: var(--yellow); box-shadow: 0 0 8px var(--yellow);"></span><span id="server-status-txt" style="color: var(--yellow); text-shadow: 0 0 8px var(--yellow);">CONNECTING</span>
-        </div>
-        <span class="conn-arrow open" id="conn-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-      </div>
-    </div>
-    <div class="conn-body" id="conn-body" style="display:none">
-      <!-- Server mode: truy cập từ localhost -->
-      <div id="conn-server-mode">
-        <div class="conn-row">
-          <span class="conn-icon"><i data-lucide="laptop" style="width:18px;height:18px"></i></span>
-          <span class="conn-label">This PC (Local)</span>
-          <a class="conn-link" href="http://localhost:5000" target="_blank">localhost:5000</a>
-          <button class="conn-copy-btn" onclick="copyUrl('http://localhost:5000',this)">Copy</button>
-        </div>
-        <div class="conn-row">
-          <span class="conn-icon"><i data-lucide="smartphone" style="width:18px;height:18px"></i></span>
-          <span class="conn-label">Other devices</span>
-          <a class="conn-link" href="http://{{ local_ip }}:5000" target="_blank">{{ local_ip }}:5000</a>
-          <button class="conn-copy-btn" onclick="copyUrl('http://{{ local_ip }}:5000',this)">Copy</button>
-        </div>
-        <div class="conn-tip" style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); padding: 8px 12px; border-radius: var(--radius-sm); margin-top: 8px; margin-bottom: 16px;"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Access from other devices via the same WiFi/LAN</div>
-
-        <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px; margin-top: 8px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 8px; margin-bottom: 8px;">
-            <div style="font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 6px;"><i data-lucide="monitor" style="width:14px;height:14px;transform:translateY(-1px)"></i> ACTIVE CLIENTS</div>
-            <div style="font-size: 12px; font-weight: 500; color: var(--text-2);" id="dash-client-count-2">0 Clients</div>
-          </div>
-          <div id="dash-client-list" style="display: flex; flex-direction: column; gap: 8px;">
-            <div style="color:var(--text-3); text-align:center; padding:10px 0; font-size: 10px;">No external clients connected</div>
-          </div>
-        </div>
-      </div>
-      <!-- Client mode: truy cập từ điện thoại / PC khác qua IP -->
-      <div id="conn-client-mode" class="hidden">
-        <div class="conn-row">
-          <span class="conn-icon"><i data-lucide="radio" style="width:18px;height:18px"></i></span>
-          <span class="conn-label">Server</span>
-          <a class="conn-link" id="conn-client-link" href="#" target="_blank">—</a>
-          <button class="conn-copy-btn" onclick="copyUrl($('conn-client-link').href,this)">Copy</button>
-        </div>
-        <div class="conn-tip"><i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Connected via Local Area Network (LAN)</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('compress',this)"><i data-lucide="minimize" class="tab-icon"></i> Compress</button>
-    <button class="tab"        onclick="switchTab('social',this)"><i data-lucide="smartphone" class="tab-icon"></i> Social</button>
-    <button class="tab"        onclick="switchTab('audio',this)"><i data-lucide="music" class="tab-icon"></i> Audio</button>
-    <button class="tab"        onclick="switchTab('download',this)"><i data-lucide="download-cloud" class="tab-icon"></i> Download</button>
-  </div>
-
-  <!-- ════════════════ NÉN VIDEO ════════════════ -->
-  <div class="panel active" id="tab-compress">
-
-    <div class="card">
-      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Video files</div>
-      <div class="drop" id="drop-compress">
-        <input type="file" multiple
-          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
-          onchange="onFileChange(this,'compress')">
-        <span class="drop-icon"><i data-lucide="upload-cloud" style="width:48px;height:48px;stroke-width:1.5"></i></span>
-        <div class="drop-txt">Click or drag & drop video here</div>
-        <div class="drop-sub">MP4 · MOV · MKV · AVI · WebM</div>
-      </div>
-      <div class="vinfo" id="vinfo-compress">
-        <input type="file" id="repick-compress" style="display:none" multiple
-          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
-          onchange="onFileChange(this,'compress')">
-        <div class="vinfo-name">
-          <span class="vn-icon"><i data-lucide="film" style="width:16px;height:16px"></i></span>
-          <span class="vn-text" id="vn-name-compress">Selected video</span>
-          <button id="btn-change-compress" class="vn-btn" onclick="document.getElementById('repick-compress').click()">Change</button>
-        </div>
-        <div class="vinfo-loading hidden" id="vinfo-loading-compress"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
-        <div id="batch-list-compress" class="dark-scroll" style="margin-top: 10px; max-height: 250px; overflow-y: auto; padding-right: 5px;">
-          <!-- Danh sách file sẽ render vào đây -->
-        </div>
-      </div>
-    </div>
-
-    <div class="card" id="card-settings-compress">
-      <div class="card-title"><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i> Encoding Settings</div>
-      <div class="row2 mb12">
-        <div>
-          <label>Encoder</label>
-          <div class="cs-wrap" id="cs-encoder">
-            <div class="cs-trigger" onclick="toggleCS('cs-encoder')">
-              <span class="cs-val" id="cs-encoder-val">Loading...</span>
-              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-            </div>
-            <div class="cs-dropdown">
-              {% for group in encoder_groups %}
-              <div class="cs-group {{ 'warn' if group.warning else '' }}">{{ group.group|safe }}</div>
-              {% for enc in group.encoders %}
-              <div class="cs-option {{ 'selected' if default_enc == enc.codec else '' }}"
-                   data-value="{{ enc.codec }}"
-                   onclick="pickEncoder('{{ enc.codec }}', this.innerHTML)">
-                {{ enc.label|safe }}
-              </div>
-              {% endfor %}
-              {% endfor %}
-            </div>
-          </div>
-          <input type="hidden" id="enc-compress" value="{{ default_enc }}">
-        </div>
-        <div>
-          <label>Format output</label>
-          <div class="cs-wrap" id="cs-format">
-            <div class="cs-trigger" onclick="toggleCS('cs-format')">
-              <span class="cs-val" id="cs-format-val"><i data-lucide="lock" style="width:14px;height:14px;vertical-align:-2px"></i> Keep original</span>
-              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-            </div>
-            <div class="cs-dropdown">
-              <div class="cs-option selected" data-value="original" onclick="pickFormat('original', this.innerHTML)"><i data-lucide="lock" style="width:14px;height:14px;vertical-align:-2px"></i> Keep original</div>
-              <div class="cs-option" data-value=".mp4" onclick="pickFormat('.mp4', this.innerHTML)">MP4 — Best compatibility</div>
-              <div class="cs-option" data-value=".mov" onclick="pickFormat('.mov', this.innerHTML)">MOV — Apple standard</div>
-              <div class="cs-option" data-value=".mkv" onclick="pickFormat('.mkv', this.innerHTML)">MKV — Flexible</div>
-            </div>
-          </div>
-          <input type="hidden" id="fmt-compress" value="original">
-        </div>
-      </div>
-
-      <!-- Advanced toggle -->
-      <div class="adv-toggle" id="adv-toggle-compress"
-           onclick="toggleAdv('adv-compress','adv-arrow-compress','adv-toggle-compress')">
-        <div class="adv-toggle-left"><span><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i></span><span>Advanced Settings</span></div>
-        <span class="adv-arrow" id="adv-arrow-compress"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-      </div>
-      <div class="adv-body" id="adv-compress">
-
-        <!-- CRF -->
-        <label style="margin-bottom:8px">Compression Quality (CRF)</label>
-        <div class="crf-presets">
-          <button class="crf-btn active" data-preset="auto" onclick="setCRFPreset('auto')">
-            <span class="crf-emoji"><i data-lucide="sparkles"></i></span>
-            <span class="crf-name">Auto</span>
-            <span class="crf-val">Per file</span>
-          </button>
-          <button class="crf-btn" data-preset="high" onclick="setCRFPreset('high')">
-            <span class="crf-emoji"><i data-lucide="trophy"></i></span>
-            <span class="crf-name">Highest</span>
-            <span class="crf-val" id="crf-lbl-high">CRF 24</span>
-          </button>
-          <button class="crf-btn" data-preset="mid" onclick="setCRFPreset('mid')">
-            <span class="crf-emoji"><i data-lucide="scale"></i></span>
-            <span class="crf-name">Balanced</span>
-            <span class="crf-val" id="crf-lbl-mid">CRF 28</span>
-          </button>
-          <button class="crf-btn" data-preset="low" onclick="setCRFPreset('low')">
-            <span class="crf-emoji"><i data-lucide="save"></i></span>
-            <span class="crf-name">Smallest</span>
-            <span class="crf-val" id="crf-lbl-low">CRF 32</span>
-          </button>
-          <button class="crf-btn" data-preset="custom" onclick="setCRFPreset('custom')">
-            <span class="crf-emoji"><i data-lucide="sliders"></i></span>
-            <span class="crf-name">Custom</span>
-            <span class="crf-val">Custom</span>
-          </button>
-        </div>
-        <div class="crf-custom-row" id="crf-custom-row">
-          <span class="crf-range-lbl">0</span>
-          <input type="range" id="crf-slider" min="0" max="51" value="24"
-                 oninput="onCRFSlider(this.value)">
-          <span class="crf-custom-val" id="crf-display">24</span>
-          <span class="crf-range-lbl" id="crf-max-lbl">51</span>
-        </div>
-        <div class="crf-hint" id="crf-hint">lower = better quality · higher = smaller file</div>
-
-        <!-- Mute audio -->
-        <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.06)">
-          <label style="margin-bottom:8px"><i data-lucide="volume-2" style="width:18px;height:18px;vertical-align:-2px"></i> Audio</label>
-          <div class="preset-grid">
-            <div class="preset-btn active" id="mute-btn-keep" onclick="setMute(false)">
-              <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
-              <span class="pi"><i data-lucide="volume-2"></i></span>
-              <div class="pn">Keep audio</div>
-            </div>
-            <div class="preset-btn" id="mute-btn-mute" onclick="setMute(true)">
-              <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
-              <span class="pi"><i data-lucide="volume-x"></i></span>
-              <div class="pn">Mute audio</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Dolby Vision -->
-        <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.06)">
-          <div class="toggle-row">
-            <div style="flex:1">
-              <label style="margin-bottom:0"><i data-lucide="sparkles" style="width:18px;height:18px;vertical-align:-2px"></i> Preserve Dolby Vision<span class="info-icon" onclick="toggleInfoTip('dv-info-tip',event)"><i data-lucide="info" style="width:13px;height:13px"></i></span></label>
-              <div class="info-tip" id="dv-info-tip">{% if dovi_available %}Keeps DV metadata (RPU) — tone mapping on DV displays.<br>H.265 only · Profile 8 (iPhone) · adds ~1–8 min.{% else %}Place <code>dovi_tool.exe</code> in <code>bin/</code> to enable.{% endif %}</div>
-            </div>
-            <label class="toggle" style="margin-top:1px;flex-shrink:0">
-              <input type="checkbox" id="dv-preserve-toggle" onchange="setDvPreserve(this.checked)"{% if not dovi_available %} disabled{% else %} checked{% endif %}>
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-        </div>
-
-      </div><!-- /adv-body -->
-    </div>
-
-    <input type="hidden" id="crf-value" value="24">
-    <div class="err" id="err-compress"></div>
-
-    <div class="prog-card hidden" id="prog-compress">
-      <div class="prog-title">
-        <div style="display:flex; align-items:center; gap:6px;">
-          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Total Progress: <span id="batch-progress-count" style="font-size:13px; font-weight:normal;"></span>
-        </div>
-        <span id="batch-elapsed-timer" style="font-size:13px; font-weight:700; color:var(--purple-l); font-variant-numeric:tabular-nums; letter-spacing:0.5px;"></span>
-      </div>
-      <div id="batch-progress-list" class="dark-scroll" style="max-height: 350px; overflow-y: auto; padding-right: 5px;"></div>
-    </div>
-
-    <div id="res-compress" class="hidden">
-      <div class="result-box">
-        <div class="res-badge" style="margin-bottom:15px"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> All tasks completed!</div>
-        <div id="batch-result-list" class="dark-scroll" style="max-height: 350px; overflow-y: auto; padding-right: 5px;"></div>
-      </div>
-      <div class="action-area" style="margin-top: 15px;">
-        <button class="btn btn-primary" onclick="location.reload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> Start new batch</button>
-      </div>
-    </div>
-
-    <div id="btn-area-compress" class="mt8">
-      <button class="btn btn-primary" id="btn-compress"
-              onclick="startCompress()" {{ 'disabled' if not tools.ffmpeg }}>
-        <i data-lucide="rocket" style="width:18px;height:18px;vertical-align:-2px"></i> Start compression
-      </button>
-    </div>
-  </div>
-
-  <!-- ════════════════ SOCIAL ════════════════ -->
-  <div class="panel" id="tab-social">
-    <div class="card">
-      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Media file</div>
-      <div class="drop" id="drop-social">
-        <input type="file"
-          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,image/jpeg,image/png,image/heic,image/heif,image/webp,.mp4,.mov,.mkv,.avi,.webm,.m4v,.jpg,.jpeg,.heic,.heif,.png,.webp"
-          onchange="onFileChange(this,'social')">
-        <span class="drop-icon"><i data-lucide="upload-cloud" style="width:48px;height:48px;stroke-width:1.5"></i></span>
-        <div class="drop-txt">Video or image</div>
-        <div class="drop-sub">Video & HEIC/JPG/PNG supported</div>
-      </div>
-      <div class="vinfo" id="vinfo-social">
-        <input type="file" id="repick-social" style="display:none"
-          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,image/jpeg,image/png,image/heic,image/heif,image/webp,.mp4,.mov,.mkv,.avi,.webm,.m4v,.jpg,.jpeg,.heic,.heif,.png,.webp"
-          onchange="onFileChange(this,'social')">
-        <div class="vinfo-name">
-          <span class="vn-icon"><i data-lucide="paperclip" style="width:16px;height:16px"></i></span>
-          <span class="vn-text" id="vn-name-social"></span>
-          <button class="vn-btn" onclick="document.getElementById('repick-social').click()">Change file</button>
-        </div>
-        <div class="vinfo-loading hidden" id="vinfo-loading-social"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
-        <div class="vinfo-grid">
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="hard-drive"></i>Size</div><div class="vinfo-val" id="vi-size-s">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="file-video"></i>Type</div><div class="vinfo-val" id="vi-type-s">—</div></div>
-        </div>
-        <div class="vinfo-grid hidden" id="vinfo-video-s">
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="cpu"></i>Codec</div><div class="vinfo-val" id="vi-codec-s">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="scan"></i>Resolution</div><div class="vinfo-val" id="vi-res-s">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="activity"></i>FPS</div><div class="vinfo-val" id="vi-fps-s">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="clock"></i>Duration</div><div class="vinfo-val" id="vi-dur-s">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="music"></i>Audio</div><div class="vinfo-val" id="vi-audio-s">—</div></div>
-        </div>
-      </div>
-    </div>
-    <div class="card" id="card-video-preset">
-      <div class="card-title"><i data-lucide="clapperboard" style="width:18px;height:18px;vertical-align:-2px"></i> Platform Preset</div>
-      <div class="preset-grid">
-        {% for key, p in social_presets.items() %}
-        <div class="preset-btn {% if loop.first %}active{% endif %}"
-             data-key="{{ key }}" onclick="selectSocialPreset('{{ key }}')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
-          <span class="pi"><i data-lucide="{{ p.icon }}" style="width:24px;height:24px"></i></span>
-          <div class="pn">{{ p.label }}</div>
-          {% if p.sub %}<div class="ps">{{ p.sub }}</div>{% endif %}
-        </div>
-        {% endfor %}
-      </div>
-    </div>
-    <div class="card hidden" id="card-photo-preset">
-      <div class="card-title"><i data-lucide="image" style="width:18px;height:18px;vertical-align:-2px"></i> Image Preset</div>
-      <div class="preset-grid">
-        {% for key, p in photo_presets.items() %}
-        <div class="preset-btn {% if loop.first %}active{% endif %}"
-             data-key="{{ key }}" onclick="selectPhotoPreset('{{ key }}')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span>
-          <span class="pi"><i data-lucide="{{ p.icon }}" style="width:24px;height:24px"></i></span>
-          <div class="pn">{{ p.label }}</div>
-        </div>
-        {% endfor %}
-      </div>
-    </div>
-    <div class="err" id="err-social"></div>
-    <div class="prog-card hidden" id="prog-social">
-      <div class="prog-title">
-        <div style="display:flex; align-items:center; gap:6px;">
-          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Exporting...
-        </div>
-      </div>
-      <div class="prog-msg" id="msg-social"></div>
-      <div class="prog-track"><div class="prog-fill" id="bar-social"></div></div>
-      <div class="prog-meta"><span id="pct-social">0%</span><span id="eta-social"></span></div>
-    </div>
-    <div id="res-social" class="hidden">
-      <div class="result-box">
-        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Export successful!</div>
-        <div class="res-filename">
-          <span class="rf-icon"><i data-lucide="smartphone"></i></span>
-          <span class="rf-text" id="res-s-fname">—</span>
-        </div>
-        <div class="res-grid">
-          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Before</div><div class="res-val" id="res-s-before">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="file-check"></i>After</div><div class="res-val" id="res-s-after">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="trending-down"></i>Reduced</div><div class="res-val" id="res-s-pct">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Elapsed</div><div class="res-val" id="res-s-time">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="scan"></i>Resolution</div><div class="res-val" id="res-s-res">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="activity"></i>FPS</div><div class="res-val" id="res-s-fps">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="music"></i>Audio</div><div class="res-val" id="res-s-audio">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="layers"></i>Preset</div><div class="res-val" id="res-s-enc">—</div></div>
-        </div>
-        <div class="warn-box hidden" id="warn-social"></div>
-      </div>
-      <div class="action-area">
-        <button class="btn btn-success" onclick="doDownload('social')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download</button>
-        <button class="btn btn-outline" onclick="resetJob('social')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New file</button>
-      </div>
-    </div>
-    <div id="btn-area-social" class="mt8">
-      <button class="btn btn-primary" id="btn-social"
-              onclick="startSocial()" {{ 'disabled' if not tools.ffmpeg }}>
-        <i data-lucide="smartphone" style="width:18px;height:18px;vertical-align:-2px"></i> Export for Social
-      </button>
-    </div>
-  </div>
-
-  <!-- ════════════════ AUDIO ════════════════ -->
-  <div class="panel" id="tab-audio">
-    <div class="card">
-      <div class="card-title"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Video file</div>
-      <div class="drop" id="drop-audio">
-        <input type="file"
-          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
-          onchange="onFileChange(this,'audio')">
-        <span class="drop-icon"><i data-lucide="music" style="width:48px;height:48px;stroke-width:1.5"></i></span>
-        <div class="drop-txt">Click to select video</div>
-        <div class="drop-sub">Will extract audio to a separate file</div>
-      </div>
-      <div class="vinfo" id="vinfo-audio">
-        <input type="file" id="repick-audio" style="display:none"
-          accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm,video/x-m4v,.mp4,.mov,.mkv,.avi,.webm,.m4v"
-          onchange="onFileChange(this,'audio')">
-        <div class="vinfo-name">
-          <span class="vn-icon"><i data-lucide="music" style="width:16px;height:16px"></i></span>
-          <span class="vn-text" id="vn-name-audio"></span>
-          <button class="vn-btn" onclick="document.getElementById('repick-audio').click()">Change file</button>
-        </div>
-        <div class="vinfo-loading hidden" id="vinfo-loading-audio"><i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;vertical-align:-2px"></i> Reading metadata...</div>
-        <div class="vinfo-grid">
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="hard-drive"></i>Size</div><div class="vinfo-val" id="vi-size-a">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="cpu"></i>Original codec</div><div class="vinfo-val" id="vi-codec-a">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="scan"></i>Resolution</div><div class="vinfo-val" id="vi-res-a">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="activity"></i>FPS</div><div class="vinfo-val" id="vi-fps-a">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="clock"></i>Duration</div><div class="vinfo-val" id="vi-dur-a">—</div></div>
-          <div class="vinfo-item"><div class="vinfo-label"><i data-lucide="music"></i>Audio</div><div class="vinfo-val" id="vi-audio-a">—</div></div>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title"><i data-lucide="music" style="width:18px;height:18px;vertical-align:-2px"></i> Audio format</div>
-      <div class="preset-grid">
-        {% for key, af in audio_formats.items() %}
-        <div class="preset-btn {% if key=='mp3' %}active{% endif %}"
-             data-key="{{ key }}" onclick="selectAudioFmt('{{ key }}')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="{{ af.icon }}" style="width:24px;height:24px"></i></span>
-          <div class="pn">{{ af.label }}</div>
-        </div>
-        {% endfor %}
-      </div>
-    </div>
-    <div class="err" id="err-audio"></div>
-    <div class="prog-card hidden" id="prog-audio">
-      <div class="prog-title">
-        <div style="display:flex; align-items:center; gap:6px;">
-          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Extracting audio...
-        </div>
-      </div>
-      <div class="prog-msg" id="msg-audio"></div>
-      <div class="prog-track"><div class="prog-fill" id="bar-audio"></div></div>
-      <div class="prog-meta"><span id="pct-audio">0%</span><span id="eta-audio"></span></div>
-    </div>
-    <div id="res-audio" class="hidden">
-      <div class="result-box">
-        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Audio extracted successfully!</div>
-        <div class="res-grid">
-          <div class="res-item"><div class="res-label"><i data-lucide="music"></i>Format</div><div class="res-val" id="res-a-fmt">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Size</div><div class="res-val" id="res-a-size">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="timer"></i>Duration</div><div class="res-val" id="res-a-dur">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Elapsed</div><div class="res-val" id="res-a-time">—</div></div>
-        </div>
-      </div>
-      <div class="action-area">
-        <button class="btn btn-success" onclick="doDownload('audio')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download</button>
-        <button class="btn btn-outline" onclick="resetJob('audio')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New file</button>
-      </div>
-    </div>
-    <div id="btn-area-audio" class="mt8">
-      <button class="btn btn-primary" id="btn-audio"
-              onclick="startAudio()" {{ 'disabled' if not tools.ffmpeg }}>
-        <i data-lucide="music" style="width:18px;height:18px;vertical-align:-2px"></i> Extract audio
-      </button>
-    </div>
-  </div>
-
-  <!-- ════════════════ DOWNLOAD ════════════════ -->
-  <div class="panel" id="tab-download">
-    {% if not tools.ytdlp %}
-    <div class="err" style="display:block"><i data-lucide="x-circle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> yt-dlp not installed! Place yt-dlp.exe in the app.py folder</div>
-    {% endif %}
-    <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-        <div class="card-title" style="margin-bottom:0"><i data-lucide="link" style="width:18px;height:18px;vertical-align:-2px"></i> Video / audio / playlist URL</div>
-        <div style="display:flex;gap:4px;background:rgba(0,0,0,.25);border:1px solid var(--card-border);border-radius:100px;padding:3px">
-          <button id="dlmode-single" class="dlmode-btn active" onclick="setDlMode('single',this)"><i data-lucide="link" style="width:13px;height:13px;vertical-align:-2px"></i> Single</button>
-          <button id="dlmode-batch"  class="dlmode-btn"        onclick="setDlMode('batch',this)"><i data-lucide="list" style="width:13px;height:13px;vertical-align:-2px"></i> Batch</button>
-        </div>
-      </div>
-      <div id="dl-single-row" class="url-row">
-        <input type="url" id="dl-url" class="dark-input" placeholder="https://youtube.com/watch?v=..." oninput="onUrlChange()">
-      </div>
-      <div id="dl-batch-row" style="display:none">
-        <textarea id="dl-urls" class="dark-input" rows="5"
-          placeholder="One URL per line:&#10;https://youtube.com/watch?v=...&#10;https://tiktok.com/@user/video/..."
-          style="width:100%;box-sizing:border-box;resize:vertical;font-size:13px;line-height:1.6;font-family:inherit"></textarea>
-        <div style="font-size:11px;color:var(--text-3);margin-top:4px"><i data-lucide="info" style="width:12px;height:12px;vertical-align:-1px;color:var(--blue)"></i> Each URL on a separate line. Playlist and quality settings apply to all.</div>
-      </div>
-      <div class="dl-title-preview" id="dl-title"></div>
-
-      {% if is_server %}
-      <div class="card-title" style="margin-top:16px"><i data-lucide="folder" style="width:18px;height:18px;vertical-align:-2px"></i> Save folder</div>
-      <div id="folder-display"
-           style="display:flex;align-items:center;gap:12px;background:rgba(var(--purple-rgb), 0.04);border:1px solid rgba(var(--purple-rgb), 0.2);border-radius:var(--radius-sm);padding:11px 14px;cursor:pointer;transition:all 0.2s;user-select:none;margin-bottom:6px"
-           onmouseover="this.style.background='rgba(var(--purple-rgb), 0.09)';this.style.borderColor='rgba(var(--purple-rgb), 0.45)'"
-           onmouseout="this.style.background='rgba(var(--purple-rgb), 0.04)';this.style.borderColor='rgba(var(--purple-rgb), 0.2)'"
-           onclick="browseFolder()">
-        <i data-lucide="folder-open" style="width:22px;height:22px;color:var(--purple-l);flex-shrink:0"></i>
-        <div style="flex:1;overflow:hidden;min-width:0">
-          <div id="folder-name-display" style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
-          <div id="folder-path-display" style="font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px"></div>
-        </div>
-        <button id="btn-browse-folder"
-                onclick="event.stopPropagation();browseFolder()"
-                style="flex-shrink:0;background:rgba(var(--purple-rgb), 0.1);border:1px solid rgba(var(--purple-rgb), 0.3);color:var(--purple-l);border-radius:var(--radius-sm);padding:5px 11px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit;display:flex;align-items:center;gap:5px;white-space:nowrap">
-          <i data-lucide="pencil" style="width:12px;height:12px"></i>
-          <span id="btn-browse-text">Change</span>
-        </button>
-      </div>
-      <input type="hidden" id="dl-output-dir" value="{{ default_out_dir }}">
-      {% else %}
-      <input type="hidden" id="dl-output-dir" value="{{ default_out_dir }}">
-      {% endif %}
-    </div>
-    <div class="card" id="card-dl-settings">
-      <div class="card-title"><i data-lucide="download-cloud" style="width:18px;height:18px;vertical-align:-2px"></i> Download type</div>
-      <div class="preset-grid mb12" style="margin-bottom:12px">
-        <div class="preset-btn active" id="dl-type-video" onclick="setDlType('video')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="clapperboard"></i></span><div class="pn">Video</div>
-        </div>
-        <div class="preset-btn" id="dl-type-audio" onclick="setDlType('audio')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="music"></i></span><div class="pn">Audio only</div>
-        </div>
-      </div>
-      <div id="dl-video-opts">
-        <label>Video quality</label>
-        <div>
-          <div class="cs-wrap" id="cs-dl-quality">
-            <div class="cs-trigger" onclick="toggleCS('cs-dl-quality')">
-              <span class="cs-val" id="cs-dl-quality-val"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</span>
-              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-            </div>
-            <div class="cs-dropdown">
-              <div class="cs-option selected" data-value="best" onclick="pickDlQuality('best', this.innerHTML)"><i data-lucide="trophy" style="width:14px;height:14px;vertical-align:-2px;color:var(--yellow)"></i> Best (4K)</div>
-              <div class="cs-option" data-value="1080p" onclick="pickDlQuality('1080p', this.innerHTML)"><i data-lucide="monitor" style="width:14px;height:14px;vertical-align:-2px"></i> 1080p</div>
-              <div class="cs-option" data-value="720p" onclick="pickDlQuality('720p', this.innerHTML)"><i data-lucide="smartphone" style="width:14px;height:14px;vertical-align:-2px"></i> 720p</div>
-              <div class="cs-option" data-value="480p" onclick="pickDlQuality('480p', this.innerHTML)"><i data-lucide="save" style="width:14px;height:14px;vertical-align:-2px"></i> 480p</div>
-            </div>
-          </div>
-          <input type="hidden" id="dl-quality" value="best">
-        </div>
-      </div>
-      <div id="dl-audio-opts" class="hidden">
-        <label>Audio quality</label>
-        <div>
-          <div class="cs-wrap" id="cs-dl-audio">
-            <div class="cs-trigger" onclick="toggleCS('cs-dl-audio')">
-              <span class="cs-val" id="cs-dl-audio-val">{{ download_audio_quality['m4a'].label|safe }}</span>
-              <span class="cs-arrow"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-            </div>
-            <div class="cs-dropdown">
-              {% for key, aq in download_audio_quality.items() %}
-              <div class="cs-option {{ 'selected' if key == 'm4a' else '' }}" data-value="{{ key }}" onclick="pickDlAudio('{{ key }}', this.innerHTML)">{{ aq.label|safe }}</div>
-              {% endfor %}
-            </div>
-          </div>
-          <input type="hidden" id="dl-audio-fmt" value="m4a">
-        </div>
-      </div>
-      <div class="adv-toggle" id="adv-toggle-download"
-           onclick="toggleAdv('adv-download','adv-arrow-download','adv-toggle-download')">
-        <div class="adv-toggle-left"><span><i data-lucide="settings" style="width:18px;height:18px;vertical-align:-2px"></i></span><span>Advanced options</span></div>
-        <span class="adv-arrow" id="adv-arrow-download"><i data-lucide="chevron-down" style="width:20px;height:20px"></i></span>
-      </div>
-      <div class="adv-body" id="adv-download">
-      <label class="playlist-toggle">
-        <input type="checkbox" id="dl-playlist" checked>
-        <div>
-          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="clipboard-list" style="width:16px;height:16px;vertical-align:-2px"></i> Download entire playlist</div>
-          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Download all videos in the playlist</div>
-        </div>
-      </label>
-      <label class="playlist-toggle" style="margin-top:8px">
-        <input type="checkbox" id="dl-subs" onchange="$('dl-subs-lang').style.display=this.checked?'flex':'none'">
-        <div>
-          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="subtitles" style="width:16px;height:16px;vertical-align:-2px"></i> Download subtitles</div>
-          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Embed subtitles into video file</div>
-        </div>
-      </label>
-      <div id="dl-subs-lang" style="display:none;align-items:center;gap:8px;margin-top:6px;padding:8px 10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
-        <span style="font-size:12px;color:var(--text-3);white-space:nowrap"><i data-lucide="languages" style="width:14px;height:14px;vertical-align:-2px"></i> Languages:</span>
-        <input type="text" id="dl-subs-lang-val" class="dark-input" placeholder="vi,en" value="vi,en" style="flex:1;padding:6px 10px;font-size:13px">
-        <span style="font-size:11px;color:var(--text-3);white-space:nowrap">comma-separated</span>
-      </div>
-      <label class="playlist-toggle" style="margin-top:8px">
-        <input type="checkbox" id="dl-trim-enable" onchange="$('dl-trim-inputs').style.display=this.checked?'block':'none';updateDlTrimHint()" disabled>
-        <div id="dl-trim-text" style="opacity:0.4; transition:opacity 0.3s">
-          <div style="font-size:13px;font-weight:600;color:var(--text)"><i data-lucide="scissors" style="width:16px;height:16px;vertical-align:-2px"></i> Download time range</div>
-          <div style="font-size:11px;color:var(--text-3);margin-top:2px">Only available after video duration is loaded</div>
-        </div>
-      </label>
-      <div id="dl-trim-inputs" style="display:none;margin-top:6px;padding:10px;background:rgba(0,0,0,.2);border-radius:var(--radius-sm)">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-          <div>
-            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="play" style="width:11px;height:11px;vertical-align:-1px"></i> Start</div>
-            <input type="text" id="dl-trim-start" class="dark-input" placeholder="e.g. 1:30 or 90" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
-          </div>
-          <div>
-            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px"><i data-lucide="square" style="width:11px;height:11px;vertical-align:-1px"></i> End</div>
-            <input type="text" id="dl-trim-end" class="dark-input" placeholder="e.g. 2:45" style="width:100%;box-sizing:border-box;text-align:center;font-weight:600;letter-spacing:1px" oninput="updateDlTrimHint()">
-          </div>
-        </div>
-        <div style="font-size:10px;color:var(--text-3);text-align:center;margin-top:6px;font-style:italic">Format: Seconds (e.g. 90) or MM:SS (e.g. 1:30) or HH:MM:SS</div>
-        <div id="dl-trim-hint" style="margin-top:5px;font-size:11px;color:var(--text-3);text-align:center;min-height:16px"></div>
-      </div>
-      <div class="section-label" style="margin-top:12px"><i data-lucide="cookie" style="width:18px;height:18px;vertical-align:-2px"></i> Cookie</div>
-      <div class="cookie-status" id="cookie-file-status"></div>
-      <div class="preset-grid preset-grid-3" style="gap:6px">
-        <div class="preset-btn active" data-browser="none" onclick="selectBrowser('none')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="ban"></i></span><div class="pn">None</div>
-        </div>
-        <div class="preset-btn" data-browser="cookies_txt" onclick="selectBrowser('cookies_txt')" id="btn-cookies-txt">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="file-text"></i></span>
-          <div class="pn" id="lbl-cookies-txt">cookies.txt</div>
-        </div>
-        <div class="preset-btn" data-browser="chrome" onclick="selectBrowser('chrome')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="globe" style="width:24px;height:24px"></i></span><div class="pn">Chrome</div>
-        </div>
-        <div class="preset-btn" data-browser="edge" onclick="selectBrowser('edge')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="compass" style="width:24px;height:24px"></i></span><div class="pn">Edge</div>
-        </div>
-        <div class="preset-btn" data-browser="firefox" onclick="selectBrowser('firefox')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="flame" style="width:24px;height:24px"></i></span><div class="pn">Firefox</div>
-        </div>
-        <div class="preset-btn" data-browser="brave" onclick="selectBrowser('brave')">
-          <span class="ck"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i></span><span class="pi"><i data-lucide="shield" style="width:24px;height:24px"></i></span><div class="pn">Brave</div>
-        </div>
-      </div>
-      <div class="browser-warn" id="browser-warn">
-        <i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i> <strong>Completely close</strong> your browser before downloading! Or use cookies.txt.
-      </div>
-      <div class="cookies-guide" id="cookies-txt-guide">
-        <i data-lucide="lightbulb" style="width:14px;height:14px;color:var(--yellow);vertical-align:-2px"></i> Install <strong>"Get cookies.txt LOCALLY"</strong> on Chrome/Edge → Export → Place in app.py folder
-      </div>
-      </div><!-- /adv-body -->
-    </div><!-- /card -->
-    <div class="err" id="err-download"></div>
-    <div class="prog-card hidden" id="prog-download">
-      <div class="prog-title">
-        <div style="display:flex; align-items:center; gap:6px;">
-          <i data-lucide="loader" class="spin-icon" style="width:16px;height:16px;"></i> Downloading...
-        </div>
-        <button id="btn-cancel-download" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:var(--red);border-radius:var(--radius-sm);padding:4px 10px;cursor:pointer;font-size:11px;font-weight:600;font-family:inherit;transition:all 0.2s;"><i data-lucide="x" style="width:14px;height:14px;vertical-align:-2px"></i> Cancel</button>
-      </div>
-      <div class="prog-msg" id="msg-download"></div>
-      <div class="prog-track"><div class="prog-fill" id="bar-download"></div></div>
-      <div class="prog-meta"><span id="pct-download">0%</span><span id="eta-download"></span></div>
-    </div>
-    <div id="res-download" class="hidden">
-      <div class="result-box">
-        <div class="res-badge"><i data-lucide="check-circle-2" style="width:16px;height:16px;vertical-align:-2px;color:var(--green)"></i> Download successful!</div>
-        <div class="res-filename">
-          <span class="rf-icon"><i data-lucide="globe"></i></span>
-          <span class="rf-text" id="res-d-title">—</span>
-          <span class="rf-badge hidden" id="res-d-count-item"><span id="res-d-count"></span></span>
-        </div>
-        <div class="res-grid">
-          <div class="res-item"><div class="res-label"><i data-lucide="hard-drive"></i>Size</div><div class="res-val" id="res-d-size">—</div></div>
-          <div class="res-item"><div class="res-label"><i data-lucide="clock"></i>Download time</div><div class="res-val" id="res-d-time">—</div></div>
-          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="clock"></i>Duration</div><div class="res-val" id="res-d-dur">—</div></div>
-          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="scan"></i>Resolution</div><div class="res-val" id="res-d-res">—</div></div>
-          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="activity"></i>FPS</div><div class="res-val" id="res-d-fps">—</div></div>
-          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="music"></i>Audio</div><div class="res-val" id="res-d-audio">—</div></div>
-          <div class="res-item res-d-detail"><div class="res-label"><i data-lucide="layers"></i>Format</div><div class="res-val" id="res-d-enc">—</div></div>
-          {% if is_server %}
-          <div class="res-item" onclick="openFolder('download')" style="cursor:pointer; transition: all 0.2s; border: 1px dashed rgba(var(--green-rgb), 0.3); background: rgba(var(--green-rgb), 0.05);" onmouseover="this.style.background='rgba(var(--green-rgb), 0.1)'; this.style.borderColor='rgba(var(--green-rgb), 0.6)';" onmouseout="this.style.background='rgba(var(--green-rgb), 0.05)'; this.style.borderColor='rgba(var(--green-rgb), 0.3)';">
-             <div class="res-label" style="color:var(--green); display: flex; align-items: center; justify-content: space-between;">Save folder <i data-lucide="external-link" style="width:12px;height:12px;opacity:0.7;"></i></div>
-             <div class="res-val" style="color:var(--green); font-weight: 700; display: flex; align-items: center; gap: 6px; margin-top:4px;">
-               <i data-lucide="folder-open" style="width:18px;height:18px;"></i> Click to open folder
-             </div>
-          </div>
-          {% endif %}
-        </div>
-        <div class="warn-box hidden" id="warn-download"></div>
-      </div>
-      <div class="action-area">
-        <button class="btn btn-success hidden" id="btn-dl-file" onclick="doDownload('download')"><i data-lucide="download" style="width:16px;height:16px;vertical-align:-2px"></i> Download to device</button>
-        <button class="btn btn-outline" onclick="resetJob('download')"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New download</button>
-      </div>
-    </div>
-
-    <!-- Batch download result list -->
-    <div id="res-batch-dl" class="hidden">
-      <div class="result-box" style="padding:0;overflow:hidden">
-        <div style="padding:12px 16px;border-bottom:1px solid rgba(255,255,255,0.06);font-size:12px;font-weight:600;color:var(--text-2);display:flex;justify-content:space-between;align-items:center">
-          <span><i data-lucide="list" style="width:14px;height:14px;vertical-align:-2px"></i> Batch download</span>
-          <span id="batch-dl-summary" style="color:var(--text-3)"></span>
-        </div>
-        <div id="batch-dl-list" style="max-height:400px;overflow-y:auto"></div>
-      </div>
-      <div class="action-area">
-        <button class="btn btn-outline" onclick="resetBatchDownload()"><i data-lucide="refresh-cw" style="width:16px;height:16px;vertical-align:-2px"></i> New batch</button>
-      </div>
-    </div>
-    <div id="btn-area-download" class="mt8">
-      <button class="btn btn-primary" id="btn-download-start"
-              onclick="startDownload()" {{ 'disabled' if not tools.ytdlp }}>
-        <i data-lucide="download-cloud" style="width:18px;height:18px;vertical-align:-2px"></i> Start download
-      </button>
-    </div>
-  </div>
-
-</div>
-
-<!-- Log Modal -->
-<div id="log-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center; padding:20px;">
-  <div style="background:var(--bg); border:1px solid var(--card-border); border-radius:var(--radius-sm); width:100%; max-width:800px; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5);">
-    <div style="padding:16px 20px; border-bottom:1px solid var(--card-border); display:flex; justify-content:space-between; align-items:center;">
-        <h3 style="margin:0; font-size:16px; display:flex; align-items:center; gap:8px;">
-          <span style="color:var(--red);"><i data-lucide="alert-triangle" style="width:16px;height:16px;vertical-align:-2px;color:var(--red)"></i></span> <span id="log-modal-title">FFmpeg Error Details</span>
-        </h3>
-        <div style="display:flex; align-items:center; gap:16px;">
-          <button onclick="copyLog(this)" style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); color:var(--text-2); border-radius:var(--radius-sm); padding:6px 12px; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:6px; transition:all 0.2s; font-weight:600; font-family:inherit;" onmouseover="this.style.background='rgba(255,255,255,0.1)'; this.style.color='var(--text)';" onmouseout="this.style.background='rgba(255,255,255,0.05)'; this.style.color='var(--text-2)';">
-            <i data-lucide="copy" style="width:14px;height:14px"></i>
-            <span>Copy</span>
-          </button>
-          <button onclick="document.getElementById('log-modal').style.display='none'" style="background:transparent; border:none; color:var(--text-3); cursor:pointer; display:flex; align-items:center; justify-content:center; padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--text)';" onmouseout="this.style.color='var(--text-3)';"><i data-lucide="x" style="width:20px;height:20px"></i></button>
-        </div>
-      </div>
-    <div style="padding:20px; flex:1; overflow-y:auto;">
-      <textarea id="log-content" readonly style="width:100%; height:400px; background:rgba(0,0,0,0.5); border:1px solid var(--card-border); border-radius:var(--radius-sm); color:var(--green); font-family:monospace; font-size:12px; padding:12px; resize:none;" class="dark-scroll"></textarea>
-    </div>
-  </div>
-</div>
-
-<!-- Metadata Compare Modal -->
-<div id="meta-compare-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center; padding:20px;" onclick="if(event.target===this)this.style.display='none';">
-  <div style="background:var(--bg); border:1px solid var(--card-border); border-radius:var(--radius-sm); width:100%; max-width:700px; max-height:80vh; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5);">
-    <div style="padding:16px 20px; border-bottom:1px solid var(--card-border); display:flex; justify-content:space-between; align-items:center; flex-shrink:0;">
-      <h3 style="margin:0; font-size:16px; display:flex; align-items:center; gap:8px;">
-        <i data-lucide="table-2" style="width:16px;height:16px;color:var(--purple-l);flex-shrink:0;"></i> <span>Metadata Comparison</span>
-      </h3>
-      <button onclick="document.getElementById('meta-compare-modal').style.display='none'" style="background:transparent; border:none; color:var(--text-3); cursor:pointer; display:flex; align-items:center; justify-content:center; padding:4px; transition:color 0.2s;" onmouseover="this.style.color='var(--text)';" onmouseout="this.style.color='var(--text-3)';"><i data-lucide="x" style="width:20px;height:20px"></i></button>
-    </div>
-    <div id="meta-compare-body" style="padding:0; flex:1; overflow-y:auto;" class="dark-scroll"></div>
-  </div>
-</div>
-
-<script>
-  window.CRF_DEFAULTS = {{ crf_defaults|tojson }};
-  window.IS_SERVER = {{ 'true' if is_server else 'false' }};
-  lucide.createIcons();
-</script>
-<script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
-  <!-- Custom Modal -->
-  <div id="custom-modal" class="modal-overlay hidden">
-    <div class="modal-card">
-      <div class="modal-icon" id="modal-icon"></div>
-      <h3 id="modal-title" style="margin:0 0 10px 0; font-size:18px; color:var(--text); text-align:center;"></h3>
-      <p id="modal-message" style="margin:0 0 20px 0; font-size:14px; color:var(--text-2); text-align:center; line-height:1.5;"></p>
-      <div style="display:flex; gap:10px; justify-content:center; width:100%;">
-        <button id="modal-btn-cancel" class="btn btn-outline" style="flex:1;">Cancel</button>
-        <button id="modal-btn-ok" class="btn btn-primary" style="flex:1;">OK</button>
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-
-===== FILE: app/workers/compress.py =====
-import os, re, time, tempfile, shutil, subprocess
+===== FILE: routes/files.py =====
+import os, re, shutil, uuid, time, urllib.parse
 from pathlib import Path
+from flask import Blueprint, request, jsonify, send_file
 from app.jobs import jobs, procs, _jobs_lock
-from app.config import FFMPEG_BIN, OUTPUT_DIR, CONTAINER_CODEC_SUPPORT, DOVI_TOOL_BIN, TEMP_DIR, CRF_DEFAULTS, CRF_AUTO_OFFSETS
-from app.config import _cpu_cores, _cpu_h_slots
-from app.utils import (
-    _probe, _fmt_size, _fmt_time, _sync_meta, _unique_output_path,
-    _get_exif_snapshot, _get_dv_info, _detect_dolby_vision, _inject_dvcc,
-    _annexb_to_mp4_samples, _dovi_mux_with_timestamps, _fix_mebx_tracks,
-    _get_rotation
-)
-from app.encoder import (
-    _get_codec_family, _get_real_enc_extra, _quality_args, _hwaccel_args, _pick_sem
-)
-from app.workers import job_guard, _run_progress, _check_path_len_job
-from app.platform_utils import free_ram_mb
+from app.config import OUTPUT_DIR, UPLOAD_DIR
+from app.utils import _sanitize_upload_filename, _check_disk_space, _extract_ui_meta, _fmt_size
 
-_DOVI_AVAILABLE = bool(DOVI_TOOL_BIN) and Path(DOVI_TOOL_BIN).exists()
-_META_HANDLER_TAGS = frozenset({"Core Media Data Handler", "GoPro MET", "Handler", "DataHandler"})
+files_bp = Blueprint("files", __name__)
 
-# Threads per concurrent CPU H265/H264 job.
-# When _cpu_h_slots jobs run in parallel, each gets an equal share of cores.
-# Example: 12 cores / 2 slots → 6 threads/job → 2 jobs × 6 = 12 threads (full CPU),
-# but RAM per job drops from ~3.5 GB to ~1.5 GB → safe for concurrent 4K batches.
-_cpu_h_per_job = max(4, _cpu_cores // max(1, _cpu_h_slots))
-_X265_LOW_RAM_MB    = 4000   # threshold for 4K jobs
-_X265_LOW_RAM_1080P = 1500   # threshold for 1080p jobs
+_BATCH_EXCLUDE = frozenset({"src_exif", "dst_exif"})
 
-def _build_x265_params(width: int = 0, height: int = 0) -> list:
-    """
-    Build -x265-params string for libx265.
+_OUTPUT_EXTS = frozenset({
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v",
+    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg",
+})
 
-    Concurrency strategy for 4K:
-    - _cpu_h_slots >= 2: partition thread pool so each concurrent job uses
-      _cpu_h_per_job threads instead of all cores. Total CPU remains 100%,
-      but RAM per job halves → no OOM on concurrent 4K batches.
-    - _cpu_h_slots == 1 (single job): use all cores freely; apply RAM-based
-      limits only if the system is genuinely low on memory.
-
-    This function is called AFTER acquiring the CPU semaphore (post-queue-wait),
-    so free_ram_mb() reflects actual memory pressure at encode start time.
-    """
-    params  = "psy-rd=1.0:psy-rdoq=0.5:aq-mode=3:aq-strength=0.8:pme=1"
-    is_4k   = (width >= 3840 or height >= 2160)
-    ram_now = free_ram_mb()
-
-    if is_4k and _cpu_h_slots >= 2:
-        # Partition: each job gets _cpu_h_per_job threads.
-        # frame-threads ≈ threads/4, capped at 4 (diminishing returns above).
-        ft = max(1, min(4, _cpu_h_per_job // 4))
-        params += (f":pools={_cpu_h_per_job}:frame-threads={ft}"
-                   ":lookahead-threads=1:rc-lookahead=20:bframes=3")
-    elif ram_now < _X265_LOW_RAM_MB:
-        # Single-job or low-RAM fallback: apply conservative limits.
-        if is_4k:
-            params += ":pools=1:frame-threads=1:lookahead-threads=1:rc-lookahead=20:bframes=3"
-        elif ram_now < _X265_LOW_RAM_1080P:
-            params += ":pools=2:lookahead-threads=1:rc-lookahead=20"
-    return ["-x265-params", params]
-
-def _auto_crf(enc: str, width: int, height: int) -> int:
-    """Return resolution-aware CRF for Auto mode.
-    Uses Highest quality base (CRF_DEFAULTS[enc][0]) + resolution offset,
-    so perceptual quality stays consistent across resolutions in a batch.
-    av1_amf uses QVBR (inverted scale) → offset is subtracted.
-    """
-    base = CRF_DEFAULTS.get(enc, (24, 28, 32, 51))[0]
-    px   = (width or 0) * (height or 0)
-    for limit, off in CRF_AUTO_OFFSETS:
-        if px < limit:
-            return base - off if enc == "av1_amf" else base + off
-    return base  # fallback — unreachable in practice (float('inf') always matches)
+_ALLOWED_PROBE_EXTS = frozenset({
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv",
+    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg",
+    ".jpg", ".jpeg", ".heic", ".heif", ".png", ".webp", ".tiff", ".tif"
+})
 
 
-
-def _job_msg(job_id, msg, pct):
+@files_bp.route("/api/status/<job_id>")
+def api_status(job_id):
     with _jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["message"] = msg
-            jobs[job_id]["progress"] = pct
+        job = jobs.get(job_id)
+        if not job: return jsonify({"error":"Job not found!"}), 404
+        data = dict(job)   # full copy — src_exif/dst_exif needed by showMetaCompare
+    return jsonify(data)
 
-
-def _dovi_cancelled(job_id) -> bool:
+@files_bp.route("/api/status_batch", methods=["POST"])
+def api_status_batch():
+    jids = (request.json or {}).get("job_ids", [])
+    res = {}
     with _jobs_lock:
-        return jobs.get(job_id, {}).get("cancelled", False)
+        for jid in jids:
+            if jid in jobs:
+                res[jid] = {k: v for k, v in jobs[jid].items() if k not in _BATCH_EXCLUDE}
+    return jsonify(res)
 
 
-def _compress_dovi_pipeline(job_id, src, dst, enc, real_enc, enc_extra, crf,
-                              mute, best_audio_idx, target_kbps, total_s, ppath,
-                              meta_stream_indices=None, x265_params=None):
-    """
-    Dolby Vision preserving pipeline — 9 steps.
+@files_bp.route("/api/download_file/<job_id>")
+def api_download_file(job_id):
+    with _jobs_lock:
+        job = jobs.get(job_id)
+        if not job or not job.get("output"):
+            return jsonify({"error":"File not ready!"}), 404
+        output   = job["output"]
+        job_type = job.get("type", "")
+        src_name = job.get("src_name", "video")
 
-    Key insight: B-frame PTS/DTS live in the MOV container's CTTS table, not in
-    the raw HEVC bitstream. By encoding to a full temp.mov first (so CTTS is
-    written correctly), then binary-patching its video samples with RPU-injected
-    data while keeping the CTTS/stts/stss tables intact, we preserve smooth
-    B-frame playback on iOS AND keep Dolby Vision — without the -bf 0 penalty.
-    """
-    tmp = Path(TEMP_DIR) / f"dovi_{job_id}"
-    tmp.mkdir(parents=True, exist_ok=True)
+    p = Path(output)
+    if not p.exists():
+        return jsonify({"error":"File has been auto-deleted (7-day limit). Please re-process."}), 404
+
+    if job_type == "compress":
+        dl_name = p.name
+
+    elif job_type in ("social", "audio"):
+        src_stem   = Path(src_name).stem
+        clean_stem = re.sub(r"[^\w\-. ]", "_", src_stem)
+        suffix_map = {"social": "_social", "audio": "_audio"}
+        dl_name = f"{clean_stem}{suffix_map.get(job_type, '')}{p.suffix}"
+
+    else:
+        dl_name = p.name
+
+    return send_file(str(p), as_attachment=True, download_name=dl_name)
+
+
+@files_bp.route("/api/log/<job_id>")
+def api_log(job_id):
+    with _jobs_lock:
+        job = jobs.get(job_id, {})
+        log_path_str = job.get("log_path")
+        log_file_name = job.get("log_file", f"ffmpeg_err_{job_id}.log")
+    if log_path_str and Path(log_path_str).exists():
+        log_path = Path(log_path_str)
+        log_name = log_path.name
+    else:
+        log_name = log_file_name
+        log_path = Path(OUTPUT_DIR) / log_name
+
+    if not log_path.exists():
+        return jsonify({"error": "No error log available for this job."}), 404
     try:
-        raw_hevc  = tmp / "raw.hevc"     # copy of source video (for RPU extraction)
-        rpu_bin   = tmp / "rpu.bin"      # extracted DV RPU metadata
-        temp_mov  = tmp / "encoded.mov" # full encoded output (video+audio, correct timestamps)
-        enc_hevc  = tmp / "enc.hevc"     # Annex-B HEVC extracted from temp_mov
-        dv_hevc   = tmp / "dv.hevc"      # enc.hevc with RPU injected
-
-        # Step 1: Extract raw HEVC from source (Annex-B, for RPU extraction)
-        _job_msg(job_id, "Extracting Dolby Vision stream...", 2)
-        r = subprocess.run([FFMPEG_BIN, "-y", "-i", str(src),
-                            "-c:v", "copy", "-an", "-f", "hevc", str(raw_hevc)],
-                           capture_output=True, timeout=120)
-        if r.returncode != 0:
-            raise RuntimeError(f"HEVC extract failed: {r.stderr.decode(errors='replace')[-1000:]}")
-
-        if _dovi_cancelled(job_id): return -1, False
-
-        # Step 2: Extract DV RPU metadata
-        _job_msg(job_id, "Extracting DV RPU metadata...", 5)
-        r = subprocess.run([DOVI_TOOL_BIN, "extract-rpu",
-                            "-i", str(raw_hevc), "-o", str(rpu_bin)],
-                           capture_output=True, timeout=120)
-        if r.returncode != 0:
-            raise RuntimeError(f"RPU extract failed: {r.stderr.decode(errors='replace')[-1000:]}")
-
-        if _dovi_cancelled(job_id): return -1, False
-
-        # Step 3: Encode to temp.mov — full output with B-frames, audio, metadata.
-        # B-frames are ALLOWED here: the container (temp.mov) correctly stores their
-        # PTS/DTS in the CTTS box. We'll preserve this CTTS in the final output.
-        _job_msg(job_id, f"Encoding DV base layer ({real_enc})...", 8)
-        x265_mem = (x265_params or []) if real_enc == "libx265" else []
-        audio_map = [] if mute else ["-map", f"0:a:{best_audio_idx}"]
-        audio_enc = [] if mute else ["-c:a", "aac", "-b:a", f"{target_kbps}k",
-                                     "-ar", "48000", "-ac", "2"]
-        encode_cmd = ([FFMPEG_BIN, "-noautorotate"] + _hwaccel_args(real_enc) +
-                      ["-i", str(src), "-map", "0:v:0"] + audio_map +
-                      ["-c:v", real_enc] +
-                      _quality_args(enc, crf) + enc_extra + x265_mem +
-                      ["-tag:v", "hvc1"] + audio_enc +
-                      ["-map_metadata", "0", "-map_metadata:s:v", "0:s:v"] +
-                      ["-movflags", "use_metadata_tags+faststart"] +
-                      ["-y", "-progress", ppath, "-stats_period", "0.5", "-nostats",
-                       str(temp_mov)])
-        rc, is_oom = _run_progress(encode_cmd, job_id, total_s, ppath)
-        if rc != 0:
-            return rc, is_oom
-
-        if _dovi_cancelled(job_id): return -1, False
-
-        # Step 4: Extract Annex-B HEVC from temp_mov (loses container timestamps,
-        # but that's OK — we will restore them via binary patching in Step 7).
-        _job_msg(job_id, "Extracting encoded HEVC stream...", 97)
-        r = subprocess.run([FFMPEG_BIN, "-y", "-i", str(temp_mov),
-                            "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb",
-                            "-an", "-f", "hevc", str(enc_hevc)],
-                           capture_output=True, timeout=120)
-        if r.returncode != 0:
-            raise RuntimeError(f"HEVC extract from temp failed: {r.stderr.decode(errors='replace')[-1000:]}")
-
-        if _dovi_cancelled(job_id): return -1, False
-
-        # Step 5: Inject RPU NAL units into the encoded HEVC bitstream
-        _job_msg(job_id, "Injecting Dolby Vision metadata...", 98)
-        r = subprocess.run([DOVI_TOOL_BIN, "inject-rpu",
-                            "-i", str(enc_hevc), "--rpu-in", str(rpu_bin),
-                            "-o", str(dv_hevc)],
-                           capture_output=True, timeout=300)
-        if r.returncode != 0:
-            raise RuntimeError(f"RPU inject failed: {r.stderr.decode(errors='replace')[-1000:]}")
-        if not dv_hevc.exists() or dv_hevc.stat().st_size < 1024:
-            raise RuntimeError(f"RPU inject produced empty output")
-
-        # Step 6: Parse dv.hevc (Annex-B) into per-frame MP4-format samples
-        _job_msg(job_id, "Parsing DV bitstream...", 98)
-        dv_samples = _annexb_to_mp4_samples(str(dv_hevc))
-        if not dv_samples:
-            raise RuntimeError("Failed to parse DV HEVC samples from dv.hevc")
-
-        # Step 7: Binary-patch temp_mov: swap video samples → dv_samples while
-        # keeping CTTS/stts/stss intact. Write result to dst.
-        _job_msg(job_id, "Muxing Dolby Vision output (timestamp-preserving)...", 99)
-        if not _dovi_mux_with_timestamps(str(temp_mov), dv_samples, str(dst)):
-            raise RuntimeError("_dovi_mux_with_timestamps failed — falling back not available")
-
-        # Step 8: Transplant mebx (Core Media Metadata) tracks from source into dst.
-        # These tracks carry dual-camera composition and Action Mode timed metadata
-        # that iOS Photos uses to display feature icons and "Camera mặt trước" info.
-        # FFmpeg corrupts mebx hdlr/stsd; _fix_mebx_tracks patches them back.
-        if meta_stream_indices:
-            _job_msg(job_id, "Copying metadata tracks...", 99)
-            mebx_out = tmp / "with_mebx.mov"
-            mebx_maps = []
-            for idx in meta_stream_indices:
-                mebx_maps += ["-map", f"1:{idx}"]
-            mebx_cmd = ([FFMPEG_BIN, "-y",
-                         "-i", str(dst), "-i", str(src),
-                         "-map", "0", "-c", "copy"] +
-                        mebx_maps +
-                        ["-c:d", "copy",
-                         "-tag:v", "hvc1",
-                         "-movflags", "use_metadata_tags+faststart",
-                         str(mebx_out)])
-            try:
-                r = subprocess.run(mebx_cmd, capture_output=True, timeout=120)
-            except subprocess.TimeoutExpired:
-                r = None  # graceful: keep dst as-is (core DV already written)
-            if r is not None and r.returncode == 0 and mebx_out.exists() and mebx_out.stat().st_size > 1024:
-                _fix_mebx_tracks(str(mebx_out))
-                os.replace(str(mebx_out), str(dst))
-
-        # Step 9: Copy dvvC/dvcC atom from source → output
-        _job_msg(job_id, "Restoring Dolby Vision container signaling...", 99)
-        _inject_dvcc(str(src), str(dst))
-
-        return 0, False
-
-    except RuntimeError as e:
-        with _jobs_lock:
-            jobs[job_id].update({"status": "error", "message": str(e)})
-        return -1, False
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+        return jsonify({"log": content, "log_file": log_name})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
-@job_guard
-def _compress_job(job_id, src: Path, enc: str, crf: int,
-                  out_ext: str, mute: bool = False, preserve_dv: bool = False,
-                  crf_auto: bool = False):
+@files_bp.route("/api/cleanup/<job_id>", methods=["DELETE"])
+def api_cleanup(job_id):
     with _jobs_lock:
-        if job_id not in jobs:
-            return
-        job = jobs[job_id]
+        job = jobs.pop(job_id, None)
+    procs.pop(job_id, None)
+    if job:
+        if job.get("status") != "done":
+            out = job.get("output")
+            if out:
+                p = Path(out)
+                if p.is_file():  p.unlink(missing_ok=True)
+                elif p.is_dir(): shutil.rmtree(p, ignore_errors=True)
 
-    if not src.exists():
-        with _jobs_lock:
-            job["status"]  = "error"
-            job["message"] = "Source file not found. Please reselect."
-        return
-
-    family = _get_codec_family(enc)
-    t0     = None
-
-    src_name = job.get("src_name", "video")
-    src_stem = re.sub(r"[^\w\-. ]", "_", Path(src_name).stem)
-
-    av1_warning = ""
-    if family == "av1" and out_ext == ".mov":
-        out_ext = ".mp4"
-        av1_warning = " (auto-converted to MP4)"
-
-    supported = CONTAINER_CODEC_SUPPORT.get(out_ext, ["h264"])
-    if family not in supported:
-        if out_ext == ".webm":
-            enc = "libaom-av1"
-            _msg = "⚠️ .WebM only supports AV1 → auto-switching to libaom-AV1"
-        else:
-            enc = "libx264"
-            _msg = f"⚠️ {out_ext.upper()} does not support {family.upper()} → switching to H.264"
-        family = _get_codec_family(enc)
-        with _jobs_lock:
-            job["message"] = _msg
-
-    dst = _unique_output_path(src_stem, out_ext)
-    if not _check_path_len_job(dst, job_id):
-        try: dst.unlink()
-        except: pass
-        try: src.unlink()
-        except: pass
-        return  # ppath not yet created at this point
-
-    real_enc, enc_extra = _get_real_enc_extra(enc)
-
-    pfd, ppath = tempfile.mkstemp(suffix=".txt", prefix="vs_")
-    os.close(pfd)
-
-    probe_data     = _probe(str(src))
-    total_s        = float(probe_data.get("format", {}).get("duration") or 0)
-
-    # Extract video dimensions and rotation for resolution-aware params and metadata sync
-    video_w = video_h = 0
-    src_rotation = 0
-    for _s in probe_data.get("streams", []):
-        if _s.get("codec_type") == "video":
-            video_w = int(_s.get("width",  0) or 0)
-            video_h = int(_s.get("height", 0) or 0)
-            src_rotation = _get_rotation(_s)
-            break
-    if crf_auto:
-        crf = _auto_crf(enc, video_w, video_h)
-        with _jobs_lock:
-            if job_id in jobs:
-                jobs[job_id]["effective_crf"] = crf
-                jobs[job_id]["crf_auto"] = True
-
-    # x265_params will be rebuilt inside the encode loop (after queue wait)
-    # so it reads free RAM at the moment encoding actually starts — not when
-    # multiple siblings may not have loaded yet.
-    _is_x265   = (real_enc == "libx265")
-    x265_params = []  # populated inside retry loop for libx265; empty for all others
-
-    # Dolby Vision detection
-    is_dv, dv_profile = _get_dv_info(probe_data)
-    use_dovi = is_dv and _DOVI_AVAILABLE and preserve_dv
-
-    # Store source metadata snapshot
-    src_exif = _get_exif_snapshot(str(src))
-    with _jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["src_exif"] = src_exif
-
-    best_audio_idx = 0
-    best_audio_br  = 0
-    _apac_idx      = None  # last-resort fallback if apac is the only stream
-    audio_streams_raw = [
-        s for s in probe_data.get("streams", [])
-        if s.get("codec_type") == "audio" and s.get("codec_name") and s.get("codec_name") != "none"
-    ]
-    audio_streams = list(enumerate(audio_streams_raw))
-    for stream_idx, s in audio_streams:
-        # Prefer decodable AAC (mp4a) over Apple Lossless/spatial (apac).
-        # apac is a 3-4ch spatial stream: re-encoding to stereo AAC without proper
-        # downmix causes iOS playback stutter (timing desync with mebx tracks).
-        # Track apac separately — only use if no other decodable stream exists.
-        codec_tag = s.get("codec_tag_string", "").lower()
-        if codec_tag == "apac":
-            if _apac_idx is None:
-                _apac_idx = stream_idx
-            continue
-        br = 0
-        raw_br = s.get("bit_rate")
-        if raw_br:
-            try: br = int(raw_br)
+        log_path_str = job.get("log_path")
+        if log_path_str:
+            try: Path(log_path_str).unlink(missing_ok=True)
             except: pass
-        if br < 10000:
-            tags = s.get("tags", {})
-            bps  = tags.get("BPS") or tags.get("BPS-eng")
-            if bps:
-                try: br = int(bps)
-                except: pass
-        if br < 10000:
-            ch = s.get("channels", 0)
-            sr = s.get("sample_rate", 0)
-            if ch and sr:
-                br = ch * int(sr) * 16
-        if br > best_audio_br:
-            best_audio_br  = br
-            best_audio_idx = stream_idx
 
-    # If no decodable stream found, fall back to apac.
-    # best_audio_br stays 0 → target_kbps correctly falls back to 192k default.
-    if best_audio_br == 0 and _apac_idx is not None:
-        best_audio_idx = _apac_idx
-
-    # Detect Apple metadata tracks (mebx, tmcd) — carry iPhone feature signaling
-    # such as Action Mode, Dual Camera, GPS track. Copy them as-is to preserve
-    # iOS Photos feature badges without re-encoding.
-    meta_stream_indices = []
-    for s in probe_data.get("streams", []):
-        if s.get("codec_type") in ("data", "tmcd"):
-            handler = s.get("tags", {}).get("handler_name", "")
-            tag = s.get("codec_tag_string", "")
-            # mebx = CoreMedia timed metadata; tmcd = timecode
-            if tag in ("mebx", "tmcd") or any(h in handler for h in _META_HANDLER_TAGS):
-                meta_stream_indices.append(s["index"])
-
-    cmd = [FFMPEG_BIN, "-noautorotate"] + _hwaccel_args(real_enc) + ["-i", str(src), "-map", "0:v:0"]
-
-    if not mute and audio_streams:
-        audio_map = (f"0:a:{best_audio_idx}"
-                     if len(audio_streams) > 1 else "0:a:0")
-        cmd += ["-map", audio_map]
-
-    for idx in meta_stream_indices:
-        cmd += ["-map", f"0:{idx}"]
-
-    cmd += ["-c:v", real_enc]
-    cmd += _quality_args(enc, crf)
-    cmd += enc_extra
-    cmd += x265_params
-
-    if family == "h265" and out_ext in (".mp4", ".mov", ".m4v"):
-        cmd += ["-tag:v", "hvc1"]
-
-    if meta_stream_indices:
-        cmd += ["-c:d", "copy"]
-
-    target_kbps = 192
-    if not mute and audio_streams:
-        target_kbps = max(128, min(320, int(best_audio_br / 1000))) if best_audio_br > 0 else 192
-        audio_br_str = f"{target_kbps}k"
-        cmd += [
-            "-c:a", "aac",
-            "-b:a", audio_br_str,
-            "-ar",  "48000",
-            "-ac",  "2",
-        ]
-
-    cmd += ["-map_metadata", "0", "-map_metadata:s:v", "0:s:v"]
-    if not mute and audio_streams:
-        cmd += ["-map_metadata:s:a", "0:s:a"]
-
-    if out_ext in (".mp4", ".mov", ".m4v"):
-        cmd += ["-movflags", "use_metadata_tags+faststart"]
-    elif out_ext != ".mkv":
-        cmd += ["-movflags", "+faststart"]
-
-    cmd += ["-y", "-progress", ppath,
-            "-stats_period", "0.5", "-nostats", str(dst)]
-
-    oom_retries = 0
-    while True:
-        with _jobs_lock:
-            job["status"]  = "waiting"
-            job["message"] = "Waiting in queue..."
-        with _pick_sem(real_enc):
-            with _jobs_lock:
-                if job.get("cancelled"): return
-            t0 = time.time()
-            # Rebuild x265 thread limits now (after queue wait) so free_ram_mb()
-            # reflects the actual pressure from other running jobs.
-            if _is_x265:
-                x265_params = _build_x265_params(video_w, video_h)
-            with _jobs_lock:
-                job["status"]  = "processing"
-                crf_note = f" — CRF {crf} (Auto)" if crf_auto else ""
-                job["message"] = f"Encoding ({real_enc}){crf_note}{av1_warning}{' — no audio' if mute else ''}..."
-                job["encode_start_time"] = t0
-            try:
-                if use_dovi:
-                    rc, is_oom = _compress_dovi_pipeline(
-                        job_id, src, dst, enc, real_enc, enc_extra, crf,
-                        mute, best_audio_idx, target_kbps, total_s, ppath,
-                        meta_stream_indices, x265_params=x265_params)
-                else:
-                    final_cmd = cmd.copy()
-                    if _is_x265 and x265_params:
-                        final_cmd = final_cmd[:-1] + x265_params + [final_cmd[-1]]
-                    rc, is_oom = _run_progress(final_cmd, job_id, total_s, ppath)
-            except Exception as e:
-                rc = -1
-                is_oom = False
-                with _jobs_lock:
-                    job.update({"status": "error", "message": f"Error: {e}"})
-
-            if rc != 0 and is_oom:
-                pass
-            else:
-                break
-
-        if rc != 0 and is_oom:
-            with _jobs_lock:
-                if job.get("cancelled"): return
-            oom_retries += 1
-            if oom_retries >= 3:
-                if use_dovi:
-                    # DV pipeline OOM → fall back to regular encode (no DV)
-                    use_dovi = False
-                    oom_retries = 0
-                    with _jobs_lock:
-                        job["status"]  = "waiting"
-                        job["message"] = "⚠️ DV preservation failed (low RAM) — encoding as HLG..."
-                    try: dst.unlink()
-                    except: pass
-                    time.sleep(2)
-                else:
-                    with _jobs_lock:
-                        job.update({"status": "error", "message": "Insufficient RAM — failed after 3 retries. Too many 4K jobs running at once."})
-                    try: dst.unlink()
-                    except: pass
-                    return
-            else:
-                with _jobs_lock:
-                    if job.get("cancelled"): return
-                    # Distinguish GPU VRAM exhaustion from CPU RAM exhaustion
-                    ram_msg = "RAM" if real_enc in ("libx265", "libx264", "libsvtav1", "libaom-av1") else "GPU"
-                    job["status"]  = "waiting"
-                    job["message"] = f"{ram_msg} full, retrying ({oom_retries}/3)..."
-                time.sleep(3)
-                with _jobs_lock:
-                    if job.get("cancelled"): return
-
-    ok = rc == 0 and dst.exists() and dst.stat().st_size > 1024
-
-    if ok:
-        # _fix_mebx_tracks already runs inside _compress_dovi_pipeline (step 8)
-        # for DV videos, so skip the redundant second pass.
-        if meta_stream_indices and not use_dovi:
-            _fix_mebx_tracks(str(dst))
-        _sync_meta(str(src), str(dst), src_rotation)
-
-        dst_exif = _get_exif_snapshot(str(dst))
-        with _jobs_lock:
-            if job_id in jobs:
-                jobs[job_id]["dst_exif"] = dst_exif
-
-        ela      = time.time() - t0 if t0 else 0
-        enc_time = _fmt_time(ela)
-
-        out_data  = _probe(str(dst))
-        out_res   = out_fps = out_audio = out_duration = "N/A"
-
-        try:
-            d = float(out_data.get("format", {}).get("duration", 0))
-            if d > 0:
-                out_duration = f"{int(d//60)}:{int(d%60):02d}"
-        except: pass
-
-        for s in out_data.get("streams", []):
-            if s.get("codec_type") == "video":
-                w, h = s.get('width', '?'), s.get('height', '?')
-                rotation = _get_rotation(s)
-                if rotation in (90, 270) and w != '?' and h != '?':
-                    out_res = f"{h}x{w}"
-                else:
-                    out_res = f"{w}x{h}"
-                r = s.get("r_frame_rate", "0/1")
-                if "/" in r:
-                    n, d2 = r.split("/")
-                    if int(d2): out_fps = f"{round(int(n)/int(d2),1)} fps"
-                break
-
-        if mute:
-            out_audio = "Muted"
-        else:
-            for s in out_data.get("streams", []):
-                if s.get("codec_type") == "audio":
-                    ac     = s.get("codec_name", "N/A").upper()
-                    br     = s.get("bit_rate")
-                    br_int = int(br) if br else 0
-                    if br_int < 10000:
-                        tags   = s.get("tags", {})
-                        br_tag = tags.get("BPS") or tags.get("BPS-eng")
-                        if br_tag:
-                            try: br_int = int(br_tag)
-                            except: pass
-                    if br_int < 10000:
-                        br_int = target_kbps * 1000
-                    brs       = f" {br_int//1000}kbps" if br_int > 10000 else ""
-                    out_audio = f"{ac}{brs}"
-                    break
-
-        result = {
-            "status":        "done",
-            "progress":      100,
-            "message":       "Completed!",
-            "output":        str(dst),
-            "sz_before":     _fmt_size(str(src)),
-            "sz_after":      _fmt_size(str(dst)),
-            "encode_time":   enc_time,
-            "out_res":       out_res,
-            "out_fps":       out_fps,
-            "out_audio":     out_audio,
-            "out_codec":     real_enc,
-            "out_duration":  out_duration,
-            "src_is_dv":     is_dv,
-            "src_dv_profile":dv_profile,
-            "dst_is_dv":     _detect_dolby_vision(out_data),
-        }
-        if family == "av1" and av1_warning:
-            result["warning"] = "<i data-lucide=\"alert-triangle\" style=\"width:16px;height:16px;vertical-align:-2px;color:var(--red)\"></i> AV1 does not support MOV format — auto-converted to MP4"
-        with _jobs_lock:
-            job.update(result)
-            log_name = job.get("log_file")
+        log_name = job.get("log_file")
         if log_name:
             try: (Path(OUTPUT_DIR) / log_name).unlink(missing_ok=True)
             except: pass
-    else:
-        with _jobs_lock:
-            if not job.get("cancelled") and job.get("status") != "error":
-                job.update({"status": "error", "message": "Compression failed!"})
-        try: dst.unlink()
+    return jsonify({"ok": True})
+
+
+@files_bp.route("/api/probe", methods=["POST"])
+def api_probe():
+    ok, msg = _check_disk_space()
+    if not ok: return jsonify({"error": msg}), 507
+    f = request.files.get("file")
+    if not f: return jsonify({"error": "No file"}), 400
+
+    orig_name = _sanitize_upload_filename(f.filename)
+    if not orig_name:
+        return jsonify({"error": "Invalid filename"}), 400
+    if Path(orig_name).suffix.lower() not in _ALLOWED_PROBE_EXTS:
+        return jsonify({"error": "Unsupported file type"}), 400
+    uid = uuid.uuid4().hex[:8]
+    tmp_path = UPLOAD_DIR / f"{Path(orig_name).stem}_{uid}{Path(orig_name).suffix}"
+    f.save(str(tmp_path))
+
+    try:
+        info = _extract_ui_meta(tmp_path)
+        info["name"] = orig_name
+        info["size"] = _fmt_size(str(tmp_path))
+        info["server_file"] = tmp_path.name
+        return jsonify(info)
+
+    except Exception as e:
+        try: tmp_path.unlink()
         except: pass
-
-    try: src.unlink()
-    except: pass
-    try: os.unlink(ppath)   # no-op if _run_progress already cleaned it
-    except: pass
-
-===== FILE: app/workers/social.py =====
-import os, re, time, tempfile, subprocess
-from pathlib import Path
-from app.jobs import jobs, _jobs_lock
-from app.config import FFMPEG_BIN, EXIFTOOL_BIN, OUTPUT_DIR
-from app.utils import _probe, _fmt_size, _fmt_time, _duration, _sync_meta, _unique_output_path
-from app.encoder import _quality_args, _hwaccel_args, _pick_sem, get_gpu_info, light_semaphore
-from app.workers import job_guard, _run_progress, _check_path_len_job
+        return jsonify({"error": str(e)}), 500
 
 
-@job_guard
-def _social_video_job(job_id, src: Path, preset: dict, preset_key: str):
-    job = jobs[job_id]
+@files_bp.route("/outputs")
+def list_outputs():
+    out_dir = Path(OUTPUT_DIR)
+    entries = []
+    for p in out_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in _OUTPUT_EXTS:
+            try:
+                st = p.stat()
+                entries.append((p.name, st.st_size, st.st_mtime))
+            except OSError:
+                pass
+    entries.sort(key=lambda x: x[2], reverse=True)
 
-    stem = re.sub(r"[^\w\-. ]", "_", src.stem)
-    dst  = _unique_output_path(f"{stem}_{preset_key}", ".mp4")
+    now = time.time()
 
-    if not _check_path_len_job(dst, job_id):
-        try: dst.unlink()
-        except: pass
-        try: src.unlink()
-        except: pass
-        return
+    def _ago(mtime):
+        s = int(now - mtime)
+        if s < 60:    return f"{s}s ago"
+        if s < 3600:  return f"{s // 60}m ago"
+        if s < 86400: return f"{s // 3600}h ago"
+        return f"{s // 86400}d ago"
 
-    total_s = _duration(str(src))
+    def _sz(n):
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024: return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} TB"
 
-    filters = []
-    scale, fps = preset.get("scale"), preset.get("fps")
-    if scale == "9:16":
-        filters.append(
-            "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p"
-        )
-    elif scale == "1080":
-        filters.append("scale=1080:-2,format=yuv420p")
-    if fps:
-        filters.append(f"fps={fps}")
+    rows = "".join(
+        f'<a href="/outputs/{urllib.parse.quote(name)}" class="item">'
+        f'<span class="name">{name}</span>'
+        f'<span class="meta">{_sz(size)} &middot; {_ago(mtime)}</span>'
+        f'</a>'
+        for name, size, mtime in entries
+    ) or '<p class="empty">No output files yet.</p>'
 
-    enc = preset["encoder"]
-    gpu, _, _ = get_gpu_info()
-    gpu_map = {
-        "libx264": ["h264_nvenc","h264_amf"],
-        "libx265": ["hevc_nvenc","hevc_amf"],
+    count = len(entries)
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VideoShrink — Outputs</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0f172a;color:#e2e8f0;font-family:-apple-system,system-ui,sans-serif;padding:16px;max-width:640px;margin:0 auto}}
+h1{{font-size:18px;font-weight:700;color:#a78bfa;margin-bottom:4px}}
+.sub{{font-size:13px;color:#64748b;margin-bottom:16px}}
+.item{{display:flex;flex-direction:column;gap:4px;padding:14px 16px;margin-bottom:8px;background:#1e293b;border-radius:10px;border:1px solid #334155;text-decoration:none;color:inherit;-webkit-tap-highlight-color:transparent}}
+.item:active{{background:#273449}}
+.name{{font-size:14px;font-weight:600;word-break:break-all}}
+.meta{{font-size:12px;color:#64748b}}
+.empty{{color:#64748b;text-align:center;margin-top:40px;font-size:14px}}
+.back-link{{display:inline-block;margin-bottom:20px;font-size:13px;color:#a78bfa;text-decoration:none}}
+.back-link:hover{{text-decoration:underline}}
+</style>
+</head>
+<body>
+<a href="/" class="back-link">&larr; Back to VideoShrink</a>
+<h1>Output Files</h1>
+<p class="sub">{count} file{"s" if count != 1 else ""} &mdash; tap to download</p>
+{rows}
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@files_bp.route("/outputs/<filename>")
+def serve_output(filename):
+    safe = (Path(OUTPUT_DIR) / Path(filename).name).resolve()
+    if not safe.is_file() or safe.parent.resolve() != Path(OUTPUT_DIR).resolve():
+        return "File not found", 404
+    return send_file(str(safe), as_attachment=True, download_name=safe.name)
+
+===== FILE: static/js/main.js =====
+// main.js — thin bootstrap + window exports
+
+import { $, sv, fmtSize, resLabel, probeCodecMap, showErr, hideErr, setBusy, updateFolderDisplay, browseFolder } from './ui/utils.js';
+import { customConfirm, customAlert, viewLog, copyLog } from './ui/modals.js';
+import { sendSync, sendBeaconPing, checkCookiesFile, detectConnectionMode, setCurrentTab, setClientStatusFn, setClientFilenameFn, setClientHidden, _updateAdminUI } from './ui/admin.js';
+import { S, CRF_DEFAULTS, setMuteAudio, setPreserveDv, setSocialFileType, socialFileType, crfPreset, crfValue, setCrfPreset, setCrfValue } from './state.js';
+import { doDownload, openFolder, resetJob, updateJobFromData } from './handlers.js';
+import { renderBatchList, probeBatchFile, cancelSingleJob, startCompress, clearAllDoneJobs, restoreActiveBatch, updateBatchJobFromData, updateBatchProgressCount, checkCompressBatchDone, getActiveCompressJobIds, removeBatchFile } from './tabs/compress.js';
+import { selectSocialPreset, selectPhotoPreset, startSocial } from './tabs/social.js';
+import { selectAudioFmt, startAudio } from './tabs/audio.js';
+import { setDlMode, setDlType, selectBrowser, onUrlChange, updateDlTrimHint, fetchTitle, getPlatformBadge, startDownload, startBatchDownload, resetBatchDownload, updateDownloadBatchJobFromData, checkDownloadBatchDone, getDownloadBatchJobIds } from './tabs/download.js';
+
+// ── Connection toggle ───────────────────────────────────────
+function toggleConn() {
+  const body  = $('conn-body');
+  const arrow = $('conn-arrow');
+  const open  = body.style.display === 'flex';
+  body.style.display = open ? 'none' : 'flex';
+  arrow.classList.toggle('open', !open);
+}
+
+// ── Advanced toggle ─────────────────────────────────────────
+function toggleAdv(bodyId, arrowId, toggleId) {
+  const body   = $(bodyId);
+  const arrow  = $(arrowId);
+  const toggle = $(toggleId);
+  const open   = body.classList.contains('open');
+  body.classList.toggle('open',   !open);
+  arrow.classList.toggle('open',  !open);
+  toggle.classList.toggle('open', !open);
+}
+
+// ── Mute toggle ─────────────────────────────────────────────
+function setMute(mute) {
+  setMuteAudio(mute);
+  $('mute-btn-keep').classList.toggle('active', !mute);
+  $('mute-btn-mute').classList.toggle('active',  mute);
+}
+
+function resetMute() { setMute(false); }
+
+// ── Info tooltip ────────────────────────────────────────────
+function toggleInfoTip(id, e) {
+  e.stopPropagation();
+  const tip = $(id);
+  const wasOpen = tip.classList.contains('show');
+  document.querySelectorAll('.info-tip.show').forEach(t => t.classList.remove('show'));
+  if (!wasOpen) tip.classList.add('show');
+}
+
+// ── DV preserve toggle ───────────────────────────────────────
+function setDvPreserve(on) {
+  const toggle = $('dv-preserve-toggle');
+  if (!toggle || toggle.disabled) return;
+  setPreserveDv(on);
+  toggle.checked = on;
+}
+
+function resetDvPreserve() { setDvPreserve(false); }
+
+// ── Tab switch ──────────────────────────────────────────────
+function switchTab(name, btn) {
+  setCurrentTab(name);
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  $('tab-' + name).classList.add('active');
+  document.querySelectorAll('.cs-wrap.open').forEach(el => el.classList.remove('open'));
+}
+
+// ── Custom Select ───────────────────────────────────────────
+function toggleCS(wrapId) {
+  const wrap   = $(wrapId);
+  const isOpen = wrap.classList.contains('open');
+  document.querySelectorAll('.cs-wrap.open').forEach(el => {
+    el.classList.remove('open');
+    const pCard = el.closest('.card');
+    if (pCard) pCard.style.zIndex = '';
+  });
+  if (!isOpen) {
+    wrap.classList.add('open');
+    const pCard = wrap.closest('.card');
+    if (pCard) pCard.style.zIndex = '100';
+  }
+}
+
+function pickEncoder(value, label) {
+  $('enc-compress').value = value;
+  $('cs-encoder-val').innerHTML = label;
+  document.querySelectorAll('#cs-encoder .cs-option').forEach(o => {
+    o.classList.toggle('selected', o.dataset.value === value);
+  });
+  const wrap = $('cs-encoder');
+  wrap.classList.remove('open');
+  const pCard = wrap.closest('.card'); if (pCard) pCard.style.zIndex = '';
+  onEncoderChange();
+}
+
+function pickFormat(value, label) {
+  $('fmt-compress').value = value;
+  $('cs-format-val').innerHTML = label;
+  document.querySelectorAll('#cs-format .cs-option').forEach(o => {
+    o.classList.toggle('selected', o.dataset.value === value);
+  });
+  const wrap = $('cs-format');
+  wrap.classList.remove('open');
+  const pCard = wrap.closest('.card'); if (pCard) pCard.style.zIndex = '';
+  onFormatChange();
+}
+
+function pickDlQuality(value, label) {
+  $('dl-quality').value = value;
+  $('cs-dl-quality-val').innerHTML = label;
+  document.querySelectorAll('#cs-dl-quality .cs-option').forEach(o => {
+    o.classList.toggle('selected', o.dataset.value === value);
+  });
+  const wrap = $('cs-dl-quality');
+  if (wrap) { wrap.classList.remove('open'); const pCard = wrap.closest('.card'); if (pCard) pCard.style.zIndex = ''; }
+  if (window.lucide) lucide.createIcons();
+}
+
+function pickDlAudio(value, label) {
+  $('dl-audio-fmt').value = value;
+  $('cs-dl-audio-val').innerHTML = label;
+  document.querySelectorAll('#cs-dl-audio .cs-option').forEach(o => {
+    o.classList.toggle('selected', o.dataset.value === value);
+  });
+  const wrap = $('cs-dl-audio');
+  if (wrap) { wrap.classList.remove('open'); const pCard = wrap.closest('.card'); if (pCard) pCard.style.zIndex = ''; }
+  if (window.lucide) lucide.createIcons();
+}
+
+window.addEventListener('click', e => {
+  if (!e.target.closest('.cs-wrap')) {
+    document.querySelectorAll('.cs-wrap.open').forEach(el => {
+      el.classList.remove('open');
+      const pCard = el.closest('.card'); if (pCard) pCard.style.zIndex = '';
+    });
+  }
+});
+
+// ── Encoder / Format / CRF ─────────────────────────────────
+function onEncoderChange() {
+  const enc  = $('enc-compress').value;
+  const defs = CRF_DEFAULTS[enc] || [24, 28, 32, 51];
+  const [hi, mid, lo, mx] = defs;
+  sv('crf-lbl-high', 'CRF ' + hi);
+  sv('crf-lbl-mid',  'CRF ' + mid);
+  sv('crf-lbl-low',  'CRF ' + lo);
+  const slider = $('crf-slider');
+  slider.max = mx;
+  sv('crf-max-lbl', mx);
+  _applyCRFPreset(crfPreset, hi, mid, lo);
+  $('crf-hint').textContent = enc === 'av1_amf'
+    ? '⚠️ AMD AV1 QVBR: HIGHER value = better quality'
+    : 'lower = better quality · higher = smaller file';
+}
+
+function onFormatChange() {
+  // placeholder — no UI changes needed currently
+}
+
+function setCRFPreset(preset) {
+  setCrfPreset(preset);
+  const enc  = $('enc-compress').value;
+  const defs = CRF_DEFAULTS[enc] || [24, 28, 32, 51];
+  _applyCRFPreset(preset, defs[0], defs[1], defs[2]);
+}
+
+function _applyCRFPreset(preset, hi, mid, lo) {
+  document.querySelectorAll('.crf-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.preset === preset);
+  });
+  const customRow = $('crf-custom-row');
+  if (preset === 'custom') {
+    customRow.classList.add('show');
+    setCrfValue(parseInt($('crf-slider').value));
+    sv('crf-display', crfValue);
+  } else {
+    customRow.classList.remove('show');
+    if (preset === 'high') setCrfValue(hi);
+    if (preset === 'mid')  setCrfValue(mid);
+    if (preset === 'low')  setCrfValue(lo);
+    // 'auto': crfValue unused — backend computes per-file from resolution
+  }
+  if (preset !== 'auto') $('crf-value').value = crfValue;
+}
+
+function onCRFSlider(val) {
+  setCrfValue(parseInt(val));
+  sv('crf-display', val);
+  $('crf-value').value = val;
+}
+
+// ── File probe ──────────────────────────────────────────────
+async function probeFile(file, tab) {
+  const loadEl = $('vinfo-loading-' + tab);
+  if (loadEl) { loadEl.classList.remove('hidden'); loadEl.textContent = 'Uploading (0%)...'; }
+
+  return new Promise((resolve) => {
+    const fd  = new FormData();
+    fd.append('file', file);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/probe', true);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && loadEl) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        loadEl.textContent = pct < 100 ? `Uploading (${pct}%)...` : 'Reading metadata...';
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status === 200) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          const sfx  = tab === 'compress' ? 'c' : tab === 'social' ? 's' : 'a';
+          sv('vi-codec-' + sfx, probeCodecMap[data.codec] || data.codec || '—');
+          sv('vi-res-'   + sfx, resLabel(data.res) || '—');
+          sv('vi-fps-'   + sfx, data.fps ? data.fps + ' fps' : '—');
+          sv('vi-dur-'   + sfx, data.duration || '—');
+          sv('vi-audio-' + sfx, data.audio    || '—');
+          sv('vi-size-'  + sfx, data.size     || '—');
+          if (data.server_file) S[tab].server_file = data.server_file;
+        } catch(e) {}
+      }
+      if (loadEl) { loadEl.classList.add('hidden'); loadEl.textContent = 'Reading metadata...'; }
+      resolve();
+    };
+
+    xhr.onerror = () => { if (loadEl) loadEl.classList.add('hidden'); resolve(); };
+    xhr.send(fd);
+  });
+}
+
+// ── File change ─────────────────────────────────────────────
+async function onFileChange(input, tab) {
+  if (tab === 'compress') {
+    // Batch logic
+    if (!input.files || input.files.length === 0) return;
+    const files = Array.from(input.files);
+    if (files.length > 50) return showErr('compress', '⚠️ Maximum 50 files per batch. Please select fewer.');
+    S.compress.files = files.map((f, i) => ({
+      id: i, file: f, server_file: null, status: 'pending', size: f.size
+    }));
+    sv('vn-name-compress', `Selected ${files.length} videos`);
+    const drop  = $('drop-compress'); if (drop)  drop.style.display  = 'none';
+    const vinfo = $('vinfo-compress'); if (vinfo) vinfo.style.display = 'block';
+    renderBatchList();
+    setBusy('compress', true);
+    const fileCount = S.compress.files.length;
+    for (let i = 0; i < fileCount; i++) {
+      if (i >= S.compress.files.length) break;
+      await probeBatchFile(i);
     }
-    for gpu_enc in gpu_map.get(enc, []):
-        if gpu_enc in gpu:
-            enc = gpu_enc
-            break
+    setBusy('compress', false);
+    return;
+  }
 
-    crf = preset["crf"]
+  // Social / Audio logic
+  const file = input.files[0]; if (!file) return;
+  S[tab].file = file;
+  input.value = '';
+  const drop  = $('drop-'  + tab); if (drop)  drop.style.display  = 'none';
+  const vinfo = $('vinfo-' + tab); if (vinfo) vinfo.style.display = 'block';
+  sv('vn-name-' + tab, file.name);
 
-    pfd, ppath = tempfile.mkstemp(suffix=".txt"); os.close(pfd)
+  if (tab === 'social') {
+    const ext = file.name.split('.').pop().toLowerCase();
+    const isPhoto = ['jpg','jpeg','heic','heif','png','webp','tiff','tif'].includes(ext);
+    setSocialFileType(isPhoto ? 'photo' : 'video');
+    $('card-video-preset').classList.toggle('hidden', socialFileType !== 'video');
+    $('card-photo-preset').classList.toggle('hidden', socialFileType !== 'photo');
+    sv('vi-type-s', socialFileType === 'photo' ? 'Photo' : 'Video');
+    const vf = $('vinfo-video-s'); if (vf) vf.classList.toggle('hidden', socialFileType !== 'video');
+    if (socialFileType !== 'video') return;
+  }
 
-    cmd = [FFMPEG_BIN] + (_hwaccel_args(enc) if not filters else []) + ["-i", str(src)]
-    if filters: cmd += ["-vf", ",".join(filters)]
-    cmd += ["-c:v", enc] + _quality_args(enc, crf)
-    if "265" in enc or "hevc" in enc: cmd += ["-tag:v","hvc1"]
-    ab   = preset["audio"]
-    cmd += [
-        "-c:a", "aac",
-        "-b:a", ab,
-        "-ar",  "48000",
-        "-ac",  "2",
-        "-map_metadata","0",
-        "-movflags","use_metadata_tags+faststart",
-        "-y","-progress",ppath,"-stats_period","0.5","-nostats", str(dst)
-    ]
+  const sfxMap = { audio: 'a', social: 's' };
+  const sfx    = sfxMap[tab] || tab;
+  sv('vi-size-' + sfx, fmtSize(file.size));
 
-    oom_retries = 0
-    while True:
-        with _jobs_lock:
-            job["status"] = "waiting"
-            job["message"] = "Waiting in queue..."
+  setBusy(tab, true);
+  await probeFile(file, tab);
+  setBusy(tab, false);
+}
 
-        t0 = None
-        with _pick_sem(enc):
-            with _jobs_lock:
-                if job.get("cancelled"): return
-                job["status"] = "processing"
-                job["message"] = f"Encoding ({enc})..."
-            t0 = time.time()
-            try:
-                rc, is_oom = _run_progress(cmd, job_id, total_s, ppath)
-            except Exception as e:
-                rc = -1
-                is_oom = False
-                with _jobs_lock:
-                    job.update({"status": "error", "message": f"Error: {e}"})
+// ── Reset ───────────────────────────────────────────────────
+function resetJobDispatch(tab) {
+  if (tab === 'compress') { clearAllDoneJobs(); return; }
+  resetJob(tab);
+  if (tab === 'audio') {
+    ['res-a-fmt','res-a-size','res-a-dur','res-a-time'].forEach(id => sv(id, '—'));
+  }
+}
 
-            if rc != 0 and is_oom:
-                pass
-            else:
-                break
+// ── Central sync loop ───────────────────────────────────────
+let _syncTimer          = null;
+let _syncBusy           = false;
+let _syncHidden         = false;
+let _lastRestoreAttempt = 0;
 
-        if rc != 0 and is_oom:
-            with _jobs_lock:
-                if job.get("cancelled"): return
-            oom_retries += 1
-            ram_msg = "RAM" if enc in ("libx265", "libx264", "libsvtav1", "libaom-av1") else "VRAM"
-            if oom_retries >= 3:
-                with _jobs_lock:
-                    job.update({"status": "error", "message": f"Insufficient {ram_msg} — failed after 3 retries."})
-                try: dst.unlink()
-                except: pass
-                return
-            with _jobs_lock:
-                gpu_msg = "RAM" if enc in ("libx265", "libx264", "libsvtav1", "libaom-av1") else "GPU"
-                job["status"] = "waiting"
-                job["message"] = f"{gpu_msg} full, retrying ({oom_retries}/3)..."
-            time.sleep(3)
-            with _jobs_lock:
-                if job.get("cancelled"): return
+function _getWatchingJobs() {
+  const ids = new Set();
+  getActiveCompressJobIds().forEach(id => ids.add(id));
+  ['social', 'audio', 'download'].forEach(t => { if (S[t].jobId && !S[t].done) ids.add(S[t].jobId); });
+  getDownloadBatchJobIds().forEach(id => ids.add(id));
+  return [...ids];
+}
 
-    ok = rc == 0 and dst.exists() and dst.stat().st_size > 1024
-    ela      = time.time() - t0 if t0 else 0
-    enc_time = _fmt_time(ela)
+function _getSyncInterval() {
+  if (_syncHidden) return 10000;
+  return _getWatchingJobs().length > 0 ? 800 : 3000;
+}
 
-    if ok:
-        _sync_meta(str(src), str(dst))
+async function _doSync() {
+  if (_syncBusy) { _syncTimer = setTimeout(_doSync, _getSyncInterval()); return; }
+  _syncBusy = true;
+  const watching = _getWatchingJobs();
+  try {
+    const data = await sendSync(watching);
+    if (data) {
+      const hasCompressBatch = S.compress.jobs && Object.keys(S.compress.jobs).length > 0;
+      const dlBatchIds = getDownloadBatchJobIds();
+      for (const [jid, jobData] of Object.entries(data.jobs || {})) {
+        if (S.compress.jobs && jid in S.compress.jobs) {
+          updateBatchJobFromData(jid, jobData);
+        } else if (S.social.jobId === jid) {
+          updateJobFromData('social', jobData);
+        } else if (S.audio.jobId === jid) {
+          updateJobFromData('audio', jobData);
+        } else if (S.download.jobId === jid) {
+          updateJobFromData('download', jobData);
+        } else if (dlBatchIds.includes(jid)) {
+          updateDownloadBatchJobFromData(jid, jobData);
+        }
+      }
+      if (hasCompressBatch) {
+        updateBatchProgressCount();
+        checkCompressBatchDone();
+      }
+      if (dlBatchIds.length > 0) {
+        checkDownloadBatchDone();
+      }
+      // Auto-restore: if server is compressing but this tab isn't watching any compress jobs
+      const now = Date.now();
+      if (data.server_state && data.server_state.includes('COMPRESSING')
+          && getActiveCompressJobIds().length === 0
+          && now - _lastRestoreAttempt > 5000) {
+        _lastRestoreAttempt = now;
+        restoreActiveBatch().then(() => {
+          if (getActiveCompressJobIds().length > 0) _startSync();
+        });
+      }
+    }
+  } finally {
+    _syncBusy = false;
+    _syncTimer = setTimeout(_doSync, _getSyncInterval());
+  }
+}
 
-        out_data  = _probe(str(dst))
-        out_res   = out_fps = out_audio = "N/A"
-        for s in out_data.get("streams", []):
-            if s.get("codec_type") == "video":
-                out_res = f"{s.get('width','?')}x{s.get('height','?')}"
-                r = s.get("r_frame_rate", "0/1")
-                if "/" in r:
-                    n, d2 = r.split("/")
-                    if int(d2): out_fps = f"{round(int(n)/int(d2),1)} fps"
-                break
-        for s in out_data.get("streams", []):
-            if s.get("codec_type") == "audio":
-                ac = s.get("codec_name", "N/A").upper()
-                out_audio = f"{ac}"
-                break
+function _startSync() {
+  clearTimeout(_syncTimer);
+  _doSync();
+}
 
-        with _jobs_lock:
-            job.update({
-                "status":"done","progress":100,"message":"Completed!",
-                "output":str(dst),
-                "sz_before":_fmt_size(str(src)),
-                "sz_after": _fmt_size(str(dst)),
-                "encode_time": enc_time,
-                "out_res": out_res,
-                "out_fps": out_fps,
-                "out_audio": out_audio,
-                "out_enc": preset.get("label", "Preset")
-            })
-    else:
-        with _jobs_lock:
-            job.update({"status":"error","message":"Export failed!"})
-        try: dst.unlink()
-        except: pass
-    try: src.unlink()
-    except: pass
-    try: Path(ppath).unlink()
-    except: pass
+// ── Admin status callbacks ──────────────────────────────────
+setClientStatusFn(() => {
+  if (S.compress.jobs && Object.values(S.compress.jobs).some(j => !j.done)) return 'compressing';
+  if (S.social.jobId   && !S.social.done)   return 'compressing';
+  if (S.audio.jobId    && !S.audio.done)    return 'extracting';
+  if ((S.download.jobId && !S.download.done) || getDownloadBatchJobIds().length > 0) return 'downloading';
+  const loadingEl = $('vinfo-loading-compress');
+  if (loadingEl && !loadingEl.classList.contains('hidden')) return 'uploading';
+  return 'idle';
+});
+setClientFilenameFn(() => {
+  const s = S.compress;
+  if (s.files && s.files.length > 0) return s.files[0].file ? s.files[0].file.name : '';
+  for (const tab of ['social', 'audio']) {
+    if (S[tab].file) return S[tab].file.name;
+  }
+  return '';
+});
 
+// ── DOMContentLoaded bootstrap ─────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  const defOpt = document.querySelector('#cs-encoder .cs-option.selected');
+  if (defOpt) $('cs-encoder-val').innerHTML = defOpt.innerHTML.trim();
+  onEncoderChange();
+  checkCookiesFile();
+  detectConnectionMode();
+  const dirInput = $('dl-output-dir');
+  if (dirInput && $('folder-name-display')) updateFolderDisplay(dirInput.value);
+  _startSync();  // start immediately for admin ping
+  restoreActiveBatch().then(() => {
+    // If active jobs were restored, kick the sync loop out of its idle interval
+    if (getActiveCompressJobIds().length > 0) _startSync();
+  });
 
-@job_guard
-def _social_photo_job(job_id, src: Path, preset: dict, preset_key: str):
-    job = jobs[job_id]
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      _syncHidden = true;
+      setClientHidden(true);
+      clearTimeout(_syncTimer);
+      if (!_syncBusy) {
+        // Use fetch (not beacon) for tab-switch — reliable, has response for admin UI
+        sendSync([]).then(data => {
+          if (data) _updateAdminUI(data);
+          _syncTimer = setTimeout(_doSync, 10000);
+        });
+      } else {
+        // In-flight sync already running — don't double-fire; let it finish and reschedule
+        _syncTimer = setTimeout(_doSync, 10000);
+      }
+    } else {
+      _syncHidden = false;
+      setClientHidden(false);
+      _startSync();  // immediate sync when re-visible
+    }
+  });
 
-    stem = re.sub(r"[^\w\-. ]", "_", src.stem)
-    dst  = _unique_output_path(f"{stem}_{preset_key}", ".jpg")
+  // Beacon only for page close — guaranteed delivery on iOS/mobile
+  document.addEventListener('pagehide', sendBeaconPing);
+});
 
-    if not _check_path_len_job(dst, job_id):
-        try: dst.unlink()
-        except: pass
-        try: src.unlink()
-        except: pass
-        return
-
-    tw, th = preset["w"], preset["h"]
-    fit    = preset.get("fit","contain")
-
-    if fit == "contain":
-        vf = (
-            f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
-            f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"colorspace=all=bt709:iall=bt709,"
-            f"format=yuvj420p"
-        )
-    else:
-        vf = (
-            f"scale={tw}:{th}:force_original_aspect_ratio=increase,"
-            f"crop={tw}:{th},"
-            f"colorspace=all=bt709:iall=bt709,"
-            f"format=yuvj420p"
-        )
-
-    q   = max(1, int((100 - preset["q"]) / 100 * 31))
-    cmd = [FFMPEG_BIN,"-i",str(src),"-vf",vf,"-q:v",str(q),"-frames:v","1","-y",str(dst)]
-    with _jobs_lock:
-        job["status"] = "waiting"
-        job["message"] = "Waiting in queue..."
-    with light_semaphore:
-        with _jobs_lock:
-            if job.get("cancelled"): return
-            job["status"] = "processing"
-            job["message"] = f"Exporting image..."
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=300)
-            rc = r.returncode
-        except subprocess.TimeoutExpired:
-            rc = -1
-            with _jobs_lock:
-                job.update({"status": "error", "message": "Photo export timeout (5min)"})
-        except Exception as e:
-            rc = -1
-            with _jobs_lock:
-                job.update({"status": "error", "message": f"Error: {e}"})
-    ok  = rc == 0 and dst.exists() and dst.stat().st_size > 1024
-
-    if ok:
-        if EXIFTOOL_BIN:
-            try:
-                subprocess.run([
-                    EXIFTOOL_BIN,
-                    "-api","LargeFileSupport=1",
-                    "-tagsfromfile", str(src),
-                    "-GPSLatitude","-GPSLongitude","-GPSAltitude",
-                    "-GPSLatitudeRef","-GPSLongitudeRef",
-                    "-DateTimeOriginal","-CreateDate",
-                    "-Make","-Model","-LensModel",
-                    "--FileModifyDate","--FileCreateDate",
-                    "-overwrite_original", str(dst)
-                ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-            except subprocess.TimeoutExpired:
-                pass
-
-        out_data  = _probe(str(dst))
-        out_res   = "N/A"
-        for s in out_data.get("streams", []):
-            if s.get("codec_type") == "video":
-                out_res = f"{s.get('width','?')}x{s.get('height','?')}"
-                break
-
-        with _jobs_lock:
-            job.update({
-                "status":"done","progress":100,"message":"Completed!",
-                "output":str(dst),
-                "sz_before":_fmt_size(str(src)),
-                "sz_after": _fmt_size(str(dst)),
-                "encode_time": "N/A",
-                "out_res": out_res,
-                "out_fps": "N/A",
-                "out_audio": "N/A",
-                "out_enc": preset.get("label", "Preset")
-            })
-    else:
-        with _jobs_lock:
-            job.update({"status":"error","message":"Photo export failed!"})
-        try: dst.unlink()
-        except: pass
-    try: src.unlink()
-    except: pass
+// ── Window exports (for inline onclick="" in HTML) ──────────
+Object.assign(window, {
+  // Tabs
+  switchTab, toggleConn, toggleAdv,
+  // Mute / DV / Info
+  setMute, resetMute, setDvPreserve, resetDvPreserve, toggleInfoTip,
+  // Custom select
+  toggleCS, pickEncoder, pickFormat, pickDlQuality, pickDlAudio,
+  // Encoder/CRF
+  onEncoderChange, setCRFPreset, onCRFSlider,
+  // File
+  onFileChange, browseFolder,
+  // Compress tab
+  startCompress, clearAllDoneJobs, cancelSingleJob, removeBatchFile,
+  // Social tab
+  startSocial, selectSocialPreset, selectPhotoPreset,
+  // Audio tab
+  startAudio, selectAudioFmt,
+  // Download tab
+  startDownload, startBatchDownload, resetBatchDownload,
+  fetchTitle, onUrlChange, updateDlTrimHint,
+  setDlMode, setDlType, selectBrowser,
+  getPlatformBadge,
+  // Shared
+  doDownload, openFolder,
+  resetJob: resetJobDispatch,
+  // Modals
+  viewLog, copyLog, customConfirm, customAlert,
+});
 
